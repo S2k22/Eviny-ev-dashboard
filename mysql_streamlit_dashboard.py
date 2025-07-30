@@ -281,6 +281,12 @@ st.markdown("""
         height: 180px;
         box-shadow: 0 2px 4px rgba(0,0,0,0.1);
     }
+    .loading-indicator {
+        text-align: center;
+        padding: 20px;
+        color: #666;
+        font-style: italic;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -300,14 +306,18 @@ if 'auto_refresh_enabled' not in st.session_state:
 if 'data_loaded' not in st.session_state:
     st.session_state.data_loaded = False
 
+# Page-specific data loading tracking
+if 'loaded_datasets' not in st.session_state:
+    st.session_state.loaded_datasets = set()
+
 # Changed refresh interval from 30 to 60 seconds
 REFRESH_INTERVAL = 60
 
 
-# More efficient data loading with better caching strategy
-@st.cache_data(ttl=60, show_spinner=False)  # Increased TTL to 60 seconds
+# Core data loading functions with page-specific caching
+@st.cache_data(ttl=60, show_spinner=False)
 def load_stations_data():
-    """Load charging stations data from MySQL"""
+    """Load charging stations data - ALWAYS NEEDED"""
     if not MYSQL_AVAILABLE or engine is None:
         st.error("❌ Database connection required. Please configure MySQL credentials.")
         st.stop()
@@ -332,7 +342,7 @@ def load_stations_data():
 
 @st.cache_data(ttl=60, show_spinner=False)
 def load_utilization_data():
-    """Load latest utilization data from MySQL"""
+    """Load latest utilization data - ALWAYS NEEDED"""
     if not MYSQL_AVAILABLE or engine is None:
         st.error("❌ Database connection required. Please configure MySQL credentials.")
         st.stop()
@@ -348,12 +358,12 @@ def load_utilization_data():
         st.stop()
 
 
+# PAGE-SPECIFIC HEAVY DATA LOADING FUNCTIONS
 @st.cache_data(ttl=60, show_spinner=False)
 def load_historical_utilization_data(hours=24):
-    """Load historical utilization data for heatmap and analytics"""
+    """Load historical utilization data - ONLY for Analytics page"""
     if not MYSQL_AVAILABLE or engine is None:
-        st.error("❌ Database connection required. Please configure MySQL credentials.")
-        st.stop()
+        return pd.DataFrame()
 
     try:
         df = get_historical_utilization(hours)
@@ -366,40 +376,63 @@ def load_historical_utilization_data(hours=24):
         return pd.DataFrame()
 
 
-@st.cache_data(ttl=300, show_spinner=False)  # Cache hourly data for 5 minutes
+@st.cache_data(ttl=300, show_spinner=False)
 def load_hourly_data():
-    """Load hourly aggregated data from MySQL"""
+    """Load hourly aggregated data - ONLY for specific pages/tabs"""
     if not MYSQL_AVAILABLE or engine is None:
-        st.error("❌ Database connection required. Please configure MySQL credentials.")
-        st.stop()
+        return pd.DataFrame()
 
     try:
         df = get_hourly_stats(hours=168)  # Last 7 days
         if df.empty:
             st.warning("⚠️ No hourly data found in database.")
-            st.stop()
+            return pd.DataFrame()
         return df
     except Exception as e:
         st.error(f"❌ Error loading hourly data: {e}")
-        st.stop()
+        return pd.DataFrame()
 
 
-@st.cache_data(ttl=300, show_spinner=False)  # Cache sessions for 5 minutes
+@st.cache_data(ttl=300, show_spinner=False)
 def load_sessions_data():
-    """Load recent charging sessions from MySQL"""
+    """Load recent charging sessions - ONLY for specific pages/tabs"""
     if not MYSQL_AVAILABLE or engine is None:
-        st.error("❌ Database connection required. Please configure MySQL credentials.")
-        st.stop()
+        return pd.DataFrame()
 
     try:
         df = get_recent_sessions(hours=168)  # Last 7 days
         if df.empty:
             st.warning("⚠️ No sessions data found in database.")
-            st.stop()
+            return pd.DataFrame()
         return df
     except Exception as e:
         st.error(f"❌ Error loading sessions data: {e}")
-        st.stop()
+        return pd.DataFrame()
+
+
+# Lightweight session summary for quick metrics
+@st.cache_data(ttl=120, show_spinner=False)
+def load_quick_session_stats():
+    """Load only basic session statistics for overview metrics"""
+    if not MYSQL_AVAILABLE or engine is None:
+        return {'daily_revenue': 0, 'session_count': 0}
+
+    try:
+        query = """
+        SELECT 
+            COUNT(*) as session_count,
+            SUM(revenue_nok) as daily_revenue
+        FROM charging_sessions 
+        WHERE end_time >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
+        """
+        result = pd.read_sql(query, engine)
+        return {
+            'daily_revenue': result['daily_revenue'].iloc[0] or 0,
+            'session_count': result['session_count'].iloc[0] or 0
+        }
+    except Exception as e:
+        logger.error(f"Error loading quick session stats: {e}")
+        return {'daily_revenue': 0, 'session_count': 0}
 
 
 # Helper function to format CEST time
@@ -412,20 +445,27 @@ def format_cest_time(dt):
 
 # Better auto-refresh functionality with navigation preservation
 def check_auto_refresh():
-    """Check if it's time to auto-refresh (every 60 seconds) without disrupting navigation"""
+    """Check if it's time to auto-refresh without disrupting navigation"""
     current_time = time.time()
 
     if (st.session_state.auto_refresh_enabled and
             current_time - st.session_state.last_refresh > REFRESH_INTERVAL):
         st.session_state.last_refresh = current_time
-        # Only clear data cache, not navigation state
+        # Only clear core data cache, not page-specific heavy datasets
         load_stations_data.clear()
         load_utilization_data.clear()
-        load_historical_utilization_data.clear()
-        # Don't clear hourly and sessions cache as frequently
-        if current_time % 300 < 60:  # Clear every 5 minutes
+        load_quick_session_stats.clear()
+        
+        # Clear page-specific data only if currently on those pages
+        current_page = st.session_state.current_page
+        if "Analytics" in current_page:
+            load_historical_utilization_data.clear()
             load_hourly_data.clear()
-            load_sessions_data.clear()
+        if current_page in ["📊 Overview", "📋 Data Explorer"]:
+            load_hourly_data.clear()
+        
+        # Reset loaded datasets tracking
+        st.session_state.loaded_datasets = set()
         st.rerun()
 
 
@@ -445,6 +485,47 @@ def show_refresh_timer():
                 '<div class="refresh-timer">🔄 Refreshing...</div>',
                 unsafe_allow_html=True
             )
+
+
+# Page-specific data loading helper
+def load_page_data(page_name, required_datasets):
+    """Load data only when needed for specific pages"""
+    loaded_data = {}
+    
+    # Always load core data
+    loaded_data['stations_df'] = load_stations_data()
+    loaded_data['utilization_df'] = load_utilization_data()
+    
+    # Load heavy datasets only when needed
+    for dataset in required_datasets:
+        if dataset not in st.session_state.loaded_datasets:
+            if dataset == 'sessions':
+                with st.spinner('Loading session data...'):
+                    loaded_data['sessions_df'] = load_sessions_data()
+                    st.session_state.loaded_datasets.add('sessions')
+            elif dataset == 'hourly':
+                with st.spinner('Loading hourly statistics...'):
+                    loaded_data['hourly_df'] = load_hourly_data()
+                    st.session_state.loaded_datasets.add('hourly')
+            elif dataset == 'historical':
+                with st.spinner('Loading historical utilization data...'):
+                    loaded_data['historical_util_df'] = load_historical_utilization_data(24)
+                    st.session_state.loaded_datasets.add('historical')
+            elif dataset == 'quick_stats':
+                loaded_data['quick_stats'] = load_quick_session_stats()
+                st.session_state.loaded_datasets.add('quick_stats')
+        else:
+            # Data already loaded, get from cache
+            if dataset == 'sessions':
+                loaded_data['sessions_df'] = load_sessions_data()
+            elif dataset == 'hourly':
+                loaded_data['hourly_df'] = load_hourly_data()
+            elif dataset == 'historical':
+                loaded_data['historical_util_df'] = load_historical_utilization_data(24)
+            elif dataset == 'quick_stats':
+                loaded_data['quick_stats'] = load_quick_session_stats()
+    
+    return loaded_data
 
 
 # Revenue calculation utilities
@@ -490,7 +571,7 @@ def handle_deployment_errors():
         st.stop()
 
 
-# Main dashboard with better navigation handling
+# Main dashboard with page-specific loading
 def main():
     # Check for auto-refresh but preserve navigation state
     check_auto_refresh()
@@ -499,7 +580,7 @@ def main():
     st.markdown("""
     <div style="text-align: center; color: #666; padding: 20px;">
         <h1 style="color: #1f77b4; margin-bottom: 1rem;">⚡ EV Charging Analytics Dashboard</h1>
-        <p>📊 MySQL Backend | Real-time Updates every 60 seconds</p>
+        <p>📊 MySQL Backend | Optimized Loading | Real-time Updates every 60 seconds</p>
         <p>Data updates automatically | Last refresh: {} CEST</p>
     </div>
     """.format(get_cest_time().strftime('%Y-%m-%d %H:%M:%S')), unsafe_allow_html=True)
@@ -507,9 +588,9 @@ def main():
     # Show refresh timer
     show_refresh_timer()
 
-    # Load data with better error handling and spinner control
+    # Load core data initially
     if not st.session_state.data_loaded:
-        with st.spinner('Loading initial data...'):
+        with st.spinner('Loading core data...'):
             try:
                 stations_df = load_stations_data()
                 utilization_df = load_utilization_data()
@@ -518,12 +599,12 @@ def main():
                 st.error(f"Error loading initial data: {e}")
                 st.stop()
     else:
-        # Load data silently after initial load
+        # Load core data silently after initial load
         try:
             stations_df = load_stations_data()
             utilization_df = load_utilization_data()
         except Exception as e:
-            st.error(f"Error refreshing data: {e}")
+            st.error(f"Error refreshing core data: {e}")
             st.stop()
 
     # Sidebar with better navigation state management
@@ -546,6 +627,8 @@ def main():
         # Update session state when page changes
         if page != st.session_state.current_page:
             st.session_state.current_page = page
+            # Clear loaded datasets when page changes to ensure fresh loading
+            st.session_state.loaded_datasets = set()
 
         st.markdown("---")
         st.markdown("### 🕐 Last Updated (CEST)")
@@ -563,6 +646,7 @@ def main():
             st.cache_data.clear()
             st.session_state.last_refresh = time.time()
             st.session_state.data_loaded = False
+            st.session_state.loaded_datasets = set()
             st.rerun()
 
         st.markdown("---")
@@ -574,6 +658,15 @@ def main():
 
         total_connectors = stations_df['total_connectors'].sum() if not stations_df.empty else 0
         st.metric("Total Connectors", total_connectors)
+
+        # Show loaded datasets indicator
+        st.markdown("---")
+        st.markdown("### 📦 Loaded Data")
+        if st.session_state.loaded_datasets:
+            for dataset in st.session_state.loaded_datasets:
+                st.success(f"✅ {dataset.title()} Data")
+        else:
+            st.info("📦 Core data only")
 
         # Database connection status
         st.markdown("---")
@@ -602,40 +695,37 @@ def main():
             else:
                 st.error(f"📡 Data {data_age:.1f}m old")
 
-    # Page routing with better state management
-    # Load additional data based on page requirements
-    hourly_df = pd.DataFrame()
-    sessions_df = pd.DataFrame()
-    historical_util_df = pd.DataFrame()
-
-    # Load sessions data for pages that need revenue information
-    if st.session_state.current_page in ["📊 Overview", "🗺️ Station Map", "📈 Utilization Analytics",
-                                         "⚡ Real-time Monitor", "📋 Data Explorer"]:
-        sessions_df = load_sessions_data()
-
-    # Load hourly data for analytics pages
-    if st.session_state.current_page in ["📊 Overview", "📈 Utilization Analytics", "📋 Data Explorer"]:
-        hourly_df = load_hourly_data()
-
-    # Load historical utilization data for analytics
-    if st.session_state.current_page == "📈 Utilization Analytics":
-        historical_util_df = load_historical_utilization_data(24)
-
-    # Route to appropriate page
+    # Page routing with page-specific data loading
     if st.session_state.current_page == "📊 Overview":
-        show_overview(stations_df, utilization_df, hourly_df, sessions_df)
+        data = load_page_data("overview", ['quick_stats', 'hourly'])
+        show_overview(data.get('stations_df'), data.get('utilization_df'), 
+                     data.get('hourly_df', pd.DataFrame()), data.get('quick_stats', {}))
+    
     elif st.session_state.current_page == "🗺️ Station Map":
-        show_station_map(stations_df, utilization_df, sessions_df)
+        data = load_page_data("map", ['sessions'])
+        show_station_map(data.get('stations_df'), data.get('utilization_df'), 
+                        data.get('sessions_df', pd.DataFrame()))
+    
     elif st.session_state.current_page == "📈 Utilization Analytics":
-        show_utilization_analytics(utilization_df, hourly_df, sessions_df, historical_util_df)
+        data = load_page_data("analytics", ['hourly', 'sessions', 'historical'])
+        show_utilization_analytics(data.get('utilization_df'), data.get('hourly_df', pd.DataFrame()), 
+                                  data.get('sessions_df', pd.DataFrame()), 
+                                  data.get('historical_util_df', pd.DataFrame()))
+    
     elif st.session_state.current_page == "⚡ Real-time Monitor":
-        show_realtime_monitor(stations_df, utilization_df, sessions_df)
+        data = load_page_data("monitor", ['sessions'])
+        show_realtime_monitor(data.get('stations_df'), data.get('utilization_df'), 
+                             data.get('sessions_df', pd.DataFrame()))
+    
     elif st.session_state.current_page == "📋 Data Explorer":
-        show_data_explorer(stations_df, utilization_df, hourly_df, sessions_df)
+        data = load_page_data("explorer", ['hourly', 'sessions'])
+        show_data_explorer(data.get('stations_df'), data.get('utilization_df'), 
+                          data.get('hourly_df', pd.DataFrame()), 
+                          data.get('sessions_df', pd.DataFrame()))
 
 
-def show_overview(stations_df, utilization_df, hourly_df, sessions_df):
-    """Show comprehensive overview dashboard"""
+def show_overview(stations_df, utilization_df, hourly_df, quick_stats):
+    """Show comprehensive overview dashboard with optimized data loading"""
     st.header("📊 Overview Dashboard")
 
     # Key metrics row
@@ -671,15 +761,9 @@ def show_overview(stations_df, utilization_df, hourly_df, sessions_df):
         )
 
     with col4:
-        if not sessions_df.empty and 'revenue_nok' in sessions_df.columns:
-            # Calculate daily revenue (last 24 hours)
-            last_24h = datetime.now() - timedelta(hours=24)
-            recent_sessions = sessions_df[sessions_df['end_time'] >= last_24h]
-            daily_revenue_nok = recent_sessions['revenue_nok'].sum()
-            daily_revenue_usd = daily_revenue_nok / 10.5  # Convert to USD
-        else:
-            daily_revenue_usd = 0
-            daily_revenue_nok = 0
+        # Use quick stats instead of full sessions data
+        daily_revenue_nok = quick_stats.get('daily_revenue', 0)
+        daily_revenue_usd = daily_revenue_nok / 10.5  # Convert to USD
 
         st.metric(
             "Daily Revenue (24h)",
@@ -734,100 +818,122 @@ def show_overview(stations_df, utilization_df, hourly_df, sessions_df):
     # Hourly utilization pattern
     st.markdown("---")
 
-    if not sessions_df.empty or not utilization_df.empty:
-        # Create comprehensive hourly pattern chart
+    if not hourly_df.empty:
+        # Create hourly pattern chart using available data
         fig_line = make_subplots(specs=[[{"secondary_y": True}]])
 
-        # Add session counts if available
-        if not sessions_df.empty and 'start_time' in sessions_df.columns:
-            sessions_df_copy = sessions_df.copy()
-            sessions_df_copy['hour'] = sessions_df_copy['start_time'].dt.hour
-            sessions_per_hour = sessions_df_copy.groupby('hour').size()
-
-            # Ensure all hours are represented
-            all_hours = pd.Series(0, index=range(24))
-            all_hours.update(sessions_per_hour)
-            sessions_per_hour = all_hours
-
+        # Add occupancy data from hourly stats
+        if 'total_occupied' in hourly_df.columns and 'hourly_timestamp' in hourly_df.columns:
+            hourly_df_sorted = hourly_df.sort_values('hourly_timestamp')
+            
             fig_line.add_trace(
-                go.Bar(
-                    x=sessions_per_hour.index,
-                    y=sessions_per_hour.values,
-                    name='Sessions Started',
-                    marker_color='#3498db',
-                    opacity=0.7
+                go.Scatter(
+                    x=hourly_df_sorted['hourly_timestamp'],
+                    y=hourly_df_sorted['total_occupied'],
+                    name='Occupied Connectors',
+                    mode='lines+markers',
+                    line=dict(color='#e74c3c', width=3),
+                    marker=dict(size=6)
                 ),
                 secondary_y=False
             )
 
-        # Add occupancy data
-        if not utilization_df.empty and 'timestamp' in utilization_df.columns:
-            hourly_occupancy = utilization_df.groupby(utilization_df['timestamp'].dt.hour)[
-                'is_occupied'].sum().reset_index()
-
+        if 'avg_occupancy_rate' in hourly_df.columns:
             fig_line.add_trace(
                 go.Scatter(
-                    x=hourly_occupancy['timestamp'],
-                    y=hourly_occupancy['is_occupied'],
-                    name='Occupied Connectors',
-                    mode='lines+markers',
-                    line=dict(color='#e74c3c', width=3),
-                    marker=dict(size=8)
+                    x=hourly_df_sorted['hourly_timestamp'],
+                    y=hourly_df_sorted['avg_occupancy_rate'] * 100,
+                    name='Occupancy Rate (%)',
+                    mode='lines',
+                    line=dict(color='#3498db', width=2, dash='dash')
                 ),
                 secondary_y=True
             )
 
         # Update layout
-        fig_line.update_xaxes(title_text="Hour of Day", tickmode='linear', tick0=0, dtick=1)
-        fig_line.update_yaxes(title_text="Sessions Started", secondary_y=False)
-        fig_line.update_yaxes(title_text="Occupied Connectors", secondary_y=True)
+        fig_line.update_xaxes(title_text="Time")
+        fig_line.update_yaxes(title_text="Occupied Connectors", secondary_y=False)
+        fig_line.update_yaxes(title_text="Occupancy Rate (%)", secondary_y=True)
         fig_line.update_layout(
-            title='24-Hour Usage Pattern',
+            title='Utilization Trends (Last 7 Days)',
             hovermode='x unified',
             legend=dict(orientation='h', y=-0.2)
         )
 
         st.plotly_chart(fig_line, use_container_width=True)
+    else:
+        # Fallback to basic utilization display
+        if not utilization_df.empty and 'timestamp' in utilization_df.columns:
+            hourly_occupancy = utilization_df.groupby(utilization_df['timestamp'].dt.hour)[
+                'is_occupied'].sum().reset_index()
 
-    # Station performance table
+            fig_simple = px.bar(
+                x=hourly_occupancy['timestamp'],
+                y=hourly_occupancy['is_occupied'],
+                title='Current Day Usage Pattern by Hour',
+                labels={'x': 'Hour of Day', 'y': 'Occupied Connectors'}
+            )
+            st.plotly_chart(fig_simple, use_container_width=True)
+
+    # Station performance summary (without full sessions data)
     st.markdown("---")
-    st.subheader("🏆 Top Performing Stations")
-
-    if not sessions_df.empty and 'station_id' in sessions_df.columns:
-        # Aggregate revenue by station
-        station_revenue = sessions_df.groupby('station_id').agg({
-            'revenue_nok': 'sum',
-            'energy_kwh': 'sum',
+    st.subheader("🏆 Station Performance Summary")
+    
+    # Show basic station info with utilization metrics
+    if not stations_df.empty and not utilization_df.empty:
+        station_utilization = utilization_df.groupby('station_id').agg({
+            'is_occupied': 'sum',
+            'is_available': 'sum',
             'connector_id': 'count'
         }).reset_index()
-        station_revenue.columns = ['station_id', 'total_revenue', 'total_energy', 'session_count']
+        station_utilization.columns = ['station_id', 'occupied_count', 'available_count', 'total_connectors']
+        
+        # Calculate utilization rate
+        station_utilization['utilization_rate'] = (
+            station_utilization['occupied_count'] / station_utilization['total_connectors']
+        ).fillna(0)
 
         # Merge with station info
-        station_performance = station_revenue.merge(
+        station_performance = station_utilization.merge(
             stations_df[['id', 'name', 'address']],
             left_on='station_id',
             right_on='id',
             how='left'
         )
 
-        # Sort by revenue and get top 10
-        station_performance = station_performance.sort_values('total_revenue', ascending=False).head(10)
+        # Sort by utilization rate and get top 10
+        station_performance = station_performance.sort_values('utilization_rate', ascending=False).head(10)
 
         if not station_performance.empty:
             st.dataframe(
-                station_performance[['name', 'address', 'total_revenue', 'total_energy', 'session_count']].rename(
+                station_performance[['name', 'address', 'occupied_count', 'total_connectors', 'utilization_rate']].rename(
                     columns={
                         'name': 'Station Name',
                         'address': 'Address',
-                        'total_revenue': 'Revenue (NOK)',
-                        'total_energy': 'Energy (kWh)',
-                        'session_count': 'Sessions'
-                    }),
+                        'occupied_count': 'Currently Occupied',
+                        'total_connectors': 'Total Connectors',
+                        'utilization_rate': 'Utilization Rate'
+                    }
+                ).round({'Utilization Rate': 3}),
                 hide_index=True,
-                use_container_width=True
+                use_container_width=True,
+                column_config={
+                    "Utilization Rate": st.column_config.ProgressColumn(
+                        "Utilization Rate",
+                        help="Current utilization rate",
+                        min_value=0,
+                        max_value=1,
+                        format="%.1%",
+                    ),
+                }
             )
+        
+        # Add button to load full session data for detailed analysis
+        if st.button("📊 Load Detailed Revenue Analysis", key="load_detailed_revenue"):
+            st.session_state.loaded_datasets.add('sessions')
+            st.rerun()
     else:
-        st.info("No session data available for station performance ranking")
+        st.info("Station performance data will appear here when utilization data is available")
 
 
 def show_station_map(stations_df, utilization_df, sessions_df):
@@ -966,7 +1072,7 @@ def show_station_map(stations_df, utilization_df, sessions_df):
 
 
 def show_utilization_analytics(utilization_df, hourly_df, sessions_df, historical_util_df):
-    """Show comprehensive utilization analytics with fixed heatmap"""
+    """Show comprehensive utilization analytics with optimized loading"""
     st.header("📈 Utilization Analytics")
 
     # Time range selector
@@ -996,14 +1102,20 @@ def show_utilization_analytics(utilization_df, hourly_df, sessions_df, historica
     filtered_hourly = hourly_df[hourly_df['hourly_timestamp'] >= time_filter] if not hourly_df.empty else hourly_df
     filtered_sessions = sessions_df[sessions_df['end_time'] >= time_filter] if not sessions_df.empty else sessions_df
 
-    # Create tabs for analytics including heatmap
+    # Create tabs for analytics with lazy loading for heavy operations
     tab1, tab2, tab3, tab4 = st.tabs(["📊 Hourly Heatmap", "📈 Trends", "⚡ Power & Revenue", "💰 Session Analysis"])
 
     with tab1:
-        # Hourly utilization heatmap
+        # Hourly utilization heatmap - only load when tab is selected
         st.subheader("Last 24 Hours Utilization Heatmap")
 
         if not historical_util_df.empty:
+            # Check if we need to reload historical data for different time range
+            if time_range == "Last 6 Hours":
+                historical_util_df = load_historical_utilization_data(6)
+            elif time_range == "Last 12 Hours":
+                historical_util_df = load_historical_utilization_data(12)
+
             # Prepare data for heatmap
             heatmap_data = historical_util_df.copy()
             heatmap_data['hour'] = heatmap_data['timestamp'].dt.hour
@@ -1057,7 +1169,7 @@ def show_utilization_analytics(utilization_df, hourly_df, sessions_df, historica
                 ))
 
                 fig_heatmap.update_layout(
-                    title='Last 24 Hours Utilization Pattern by Hour and Day<br><sub>Colors optimized for typical 15% average occupancy</sub>',
+                    title=f'{time_range} Utilization Pattern by Hour and Day<br><sub>Colors optimized for typical 15% average occupancy</sub>',
                     xaxis_title='Hour of Day',
                     yaxis_title='Day of Week',
                     height=500,
@@ -1091,9 +1203,12 @@ def show_utilization_analytics(utilization_df, hourly_df, sessions_df, historica
                     st.metric("Peak Hour", f"{peak_hour}:00", f"{hourly_avg[peak_hour]:.1%}")
 
             else:
-                st.warning("No hourly pattern data available")
+                st.warning("No hourly pattern data available for the selected time range")
         else:
             st.warning("No historical utilization data available")
+            if st.button("📊 Load Historical Data", key="load_historical_data"):
+                st.session_state.loaded_datasets.add('historical')
+                st.rerun()
 
     with tab2:
         # Peak hours analysis
@@ -1160,10 +1275,10 @@ def show_utilization_analytics(utilization_df, hourly_df, sessions_df, historica
 
             st.plotly_chart(fig_trend, use_container_width=True)
         else:
-            st.info("No hourly trend data available")
+            st.info("No hourly trend data available for the selected time range")
 
     with tab3:
-        # Power and Revenue Analysis
+        # Power and Revenue Analysis - only loads when tab is accessed
         st.subheader("Power Consumption & Revenue Analysis")
 
         if not filtered_sessions.empty:
@@ -1242,9 +1357,12 @@ def show_utilization_analytics(utilization_df, hourly_df, sessions_df, historica
 
         else:
             st.info("No session data available for the selected time range")
+            if st.button("📊 Load Session Data", key="load_session_data_analytics"):
+                st.session_state.loaded_datasets.add('sessions')
+                st.rerun()
 
     with tab4:
-        # Session Analysis
+        # Session Analysis - loads sessions data if not already loaded
         st.subheader("Detailed Session Analysis")
 
         if not filtered_sessions.empty:
@@ -1277,6 +1395,9 @@ def show_utilization_analytics(utilization_df, hourly_df, sessions_df, historica
 
         else:
             st.info("No session data available for analysis")
+            if st.button("📊 Load Session Data for Analysis", key="load_session_data_analysis"):
+                st.session_state.loaded_datasets.add('sessions')
+                st.rerun()
 
 
 def show_realtime_monitor(stations_df, utilization_df, sessions_df):
@@ -1309,7 +1430,7 @@ def show_realtime_monitor(stations_df, utilization_df, sessions_df):
 
     st.markdown("---")
 
-    # Real-time revenue tracking
+    # Real-time revenue tracking - only load if sessions data is available
     if not sessions_df.empty:
         st.subheader("💰 Real-time Revenue Tracking")
 
@@ -1331,6 +1452,12 @@ def show_realtime_monitor(stations_df, utilization_df, sessions_df):
 
         with col3:
             st.metric("Active Sessions", current_occupied)
+    else:
+        st.subheader("💰 Real-time Revenue Tracking")
+        st.info("Revenue data not loaded. Click below to load session data for revenue tracking.")
+        if st.button("📊 Load Revenue Data", key="load_revenue_data"):
+            st.session_state.loaded_datasets.add('sessions')
+            st.rerun()
 
     st.markdown("---")
 
@@ -1392,7 +1519,7 @@ def show_realtime_monitor(stations_df, utilization_df, sessions_df):
                         </div>
                         """, unsafe_allow_html=True)
 
-    # Recent activity feed
+    # Recent activity feed - only show if sessions data is loaded
     st.markdown("---")
     st.subheader("📰 Recent Session Activity")
 
@@ -1427,11 +1554,14 @@ def show_realtime_monitor(stations_df, utilization_df, sessions_df):
                 f"*{time_str}*"
             )
     else:
-        st.info("No recent session activity to display")
+        st.info("Recent activity will appear here when session data is loaded.")
+        if st.button("📊 Load Activity Feed", key="load_activity_feed"):
+            st.session_state.loaded_datasets.add('sessions')
+            st.rerun()
 
 
 def show_data_explorer(stations_df, utilization_df, hourly_df, sessions_df):
-    """Show comprehensive data explorer interface"""
+    """Show comprehensive data explorer interface with optimized loading"""
     st.header("📋 Data Explorer")
 
     # Dataset selector
@@ -1445,21 +1575,39 @@ def show_data_explorer(stations_df, utilization_df, hourly_df, sessions_df):
     if dataset == "Charging Stations":
         df = stations_df
         description = "Complete list of all charging stations with their specifications and current status."
+        data_loaded = True
     elif dataset == "Utilization Data":
         df = utilization_df
         description = "Detailed connector-level utilization records showing real-time usage patterns."
+        data_loaded = True
     elif dataset == "Hourly Aggregations":
         df = hourly_df
         description = "Hourly aggregated data showing utilization trends over time."
+        data_loaded = 'hourly' in st.session_state.loaded_datasets
     else:
         df = sessions_df
         description = "Completed charging sessions with duration, energy consumed, and revenue generated."
+        data_loaded = 'sessions' in st.session_state.loaded_datasets
 
     st.markdown(f"*{description}*")
 
-    if df.empty:
-        st.warning(f"No data available for {dataset}")
-        return
+    # Check if data needs to be loaded
+    if not data_loaded or df.empty:
+        if dataset == "Hourly Aggregations":
+            st.info("Hourly aggregation data not loaded yet.")
+            if st.button("📊 Load Hourly Data", key="load_hourly_explorer"):
+                st.session_state.loaded_datasets.add('hourly')
+                st.rerun()
+            return
+        elif dataset == "Charging Sessions":
+            st.info("Session data not loaded yet.")
+            if st.button("📊 Load Session Data", key="load_sessions_explorer"):
+                st.session_state.loaded_datasets.add('sessions')
+                st.rerun()
+            return
+        else:
+            st.warning(f"No data available for {dataset}")
+            return
 
     # Data filters
     st.subheader("🔍 Filters")
@@ -1579,7 +1727,7 @@ def show_data_explorer(stations_df, utilization_df, hourly_df, sessions_df):
     # Column selector
     if st.checkbox("Select specific columns", key="explorer_column_selector"):
         selected_columns = st.multiselect("Choose columns", filtered_df.columns.tolist(),
-                                          default=filtered_df.columns.tolist(), key="explorer_columns")
+                                          default=filtered_df.columns.tolist()[:10], key="explorer_columns")
         if selected_columns:
             display_df = filtered_df[selected_columns]
         else:
@@ -1658,14 +1806,34 @@ def show_data_explorer(stations_df, utilization_df, hourly_df, sessions_df):
                     key="download_summary"
                 )
 
+    # Performance optimization info
+    st.markdown("---")
+    with st.expander("🚀 Performance Optimization Info"):
+        st.markdown(f"""
+        **Page-Specific Loading Active:**
+        - ✅ Core data (stations, utilization) always loaded
+        - 📊 Heavy datasets loaded only when needed:
+          - Sessions data: {len(st.session_state.loaded_datasets & {'sessions'})} loaded
+          - Hourly data: {len(st.session_state.loaded_datasets & {'hourly'})} loaded
+          - Historical data: {len(st.session_state.loaded_datasets & {'historical'})} loaded
+        
+        **Currently loaded datasets:** {', '.join(st.session_state.loaded_datasets) if st.session_state.loaded_datasets else 'Core data only'}
+        
+        **Benefits:**
+        - 🚀 Faster initial page loads
+        - 💾 Reduced memory usage
+        - 🔄 Fewer database queries
+        - ⚡ Better user experience
+        """)
+
 
 # Footer
 def add_footer():
     st.markdown("---")
     st.markdown("""
     <div style="text-align: center; color: #666; padding: 20px;">
-        <p>⚡ EV Charging Analytics Dashboard | MySQL Backend | Auto-refresh Enabled</p>
-        <p>Data updates automatically every 60 seconds</p>
+        <p>⚡ EV Charging Analytics Dashboard | MySQL Backend | Optimized Page-Specific Loading</p>
+        <p>Core data updates every 60 seconds | Heavy datasets load on-demand</p>
     </div>
     """, unsafe_allow_html=True)
 
