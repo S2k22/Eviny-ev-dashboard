@@ -996,8 +996,11 @@ def show_utilization_analytics(utilization_df, hourly_df, sessions_df, historica
     filtered_hourly = hourly_df[hourly_df['hourly_timestamp'] >= time_filter] if not hourly_df.empty else hourly_df
     filtered_sessions = sessions_df[sessions_df['end_time'] >= time_filter] if not sessions_df.empty else sessions_df
 
-    # Heatmap button
-    if st.button("📊 Show 24-Hour Utilization Heatmap", type="primary"):
+    # Create tabs for analytics including heatmap
+    tab1, tab2, tab3, tab4 = st.tabs(["📊 Hourly Heatmap", "📈 Trends", "⚡ Power & Revenue", "💰 Session Analysis"])
+
+    with tab1:
+        # Hourly utilization heatmap
         st.subheader("Last 24 Hours Utilization Heatmap")
         
         if not historical_util_df.empty:
@@ -1098,10 +1101,7 @@ def show_utilization_analytics(utilization_df, hourly_df, sessions_df, historica
         else:
             st.warning("No historical utilization data available")
 
-    # Create tabs for additional analytics
-    tab1, tab2, tab3 = st.tabs(["📈 Trends", "⚡ Power & Revenue", "💰 Session Analysis"])
-
-    with tab1:
+    with tab2:
         # Peak hours analysis
         col1, col2 = st.columns(2)
 
@@ -1168,7 +1168,7 @@ def show_utilization_analytics(utilization_df, hourly_df, sessions_df, historica
         else:
             st.info("No hourly trend data available")
 
-    with tab2:
+    with tab3:
         # Power and Revenue Analysis
         st.subheader("Power Consumption & Revenue Analysis")
 
@@ -1249,7 +1249,7 @@ def show_utilization_analytics(utilization_df, hourly_df, sessions_df, historica
         else:
             st.info("No session data available for the selected time range")
 
-    with tab3:
+    with tab4:
         # Session Analysis
         st.subheader("Detailed Session Analysis")
 
@@ -1279,6 +1279,14 @@ def show_utilization_analytics(utilization_df, hourly_df, sessions_df, historica
                     labels={'revenue_nok': 'Revenue (NOK)', 'count': 'Number of Sessions'}
                 )
                 fig_revenue_dist.update_traces(marker_color='#2ecc71')
+                st.plotly_chart(fig_revenue_dist, use_container_width=True)
+
+        else:
+            st.info("No session data available for analysis")71')
+                st.plotly_chart(fig_revenue_dist, use_container_width=True)
+
+        else:
+            st.info("No session data available for analysis")71')
                 st.plotly_chart(fig_revenue_dist, use_container_width=True)
 
         else:
