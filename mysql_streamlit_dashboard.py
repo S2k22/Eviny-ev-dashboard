@@ -1030,8 +1030,6 @@ def show_utilization_analytics(utilization_df, hourly_df, sessions_df, historica
                 pivot_table = pivot_table.fillna(0)
 
                 # Create custom colorscale optimized for low occupancy rates
-                # Based on: 15% average, 25% high occupancy
-                # Scale colors more aggressively for low values
                 custom_colorscale = [
                     [0.0, '#27ae60'],     # 0% - Dark green (fully available)
                     [0.05, '#2ecc71'],    # ~2% - Green 
@@ -1279,14 +1277,6 @@ def show_utilization_analytics(utilization_df, hourly_df, sessions_df, historica
                     labels={'revenue_nok': 'Revenue (NOK)', 'count': 'Number of Sessions'}
                 )
                 fig_revenue_dist.update_traces(marker_color='#2ecc71')
-                st.plotly_chart(fig_revenue_dist, use_container_width=True)
-
-        else:
-            st.info("No session data available for analysis")71')
-                st.plotly_chart(fig_revenue_dist, use_container_width=True)
-
-        else:
-            st.info("No session data available for analysis")71')
                 st.plotly_chart(fig_revenue_dist, use_container_width=True)
 
         else:
