@@ -1,0 +1,17 @@
+# Core dependencies for EV Charging Dashboard
+streamlit
+pandas
+numpy
+plotly
+folium
+streamlit-folium
+
+# Database connectivity
+pymysql
+sqlalchemy
+cryptography
+
+# Additional utilities
+python-dotenv
+pytz
+xlsxwriter
