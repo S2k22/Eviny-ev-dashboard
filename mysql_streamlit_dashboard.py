@@ -1048,11 +1048,7 @@ def show_utilization_analytics(utilization_df, hourly_df, sessions_df, historica
                     y=pivot_table.index.tolist(),
                     colorscale=custom_colorscale,
                     colorbar=dict(
-                        title='Occupancy Rate',
-                        tickmode='array',
-                        tickvals=[0, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40],
-                        ticktext=['0%', '5%', '10%', '15%', '20%', '25%', '30%', '35%', '40%+'],
-                        titleside='right'
+                        title='Occupancy Rate'
                     ),
                     hoverongaps=False,
                     hovertemplate='Day: %{y}<br>Hour: %{x}:00<br>Occupancy: %{z:.1%}<extra></extra>',
