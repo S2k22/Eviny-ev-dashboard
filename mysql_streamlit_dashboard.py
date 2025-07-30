@@ -969,72 +969,169 @@ def show_utilization_analytics(utilization_df, hourly_df, sessions_df, historica
     """Show comprehensive utilization analytics with fixed heatmap"""
     st.header("📈 Utilization Analytics")
 
-    # Hourly utilization heatmap - FIXED VERSION
-    st.subheader("Last 24 Hours Utilization Heatmap")
+    # Time range selector
+    time_range = st.select_slider(
+        "Select Time Range",
+        options=["Last 6 Hours", "Last 12 Hours", "Last 24 Hours", "Last 7 Days", "All Data"],
+        value="Last 24 Hours",
+        key="analytics_time_range"
+    )
 
-    if not historical_util_df.empty:
-        # Prepare data for heatmap
-        heatmap_data = historical_util_df.copy()
-        heatmap_data['hour'] = heatmap_data['timestamp'].dt.hour
-        heatmap_data['day'] = heatmap_data['timestamp'].dt.day_name()
-        
-        # Calculate occupancy rate for each day-hour combination
-        pivot_data = heatmap_data.groupby(['day', 'hour'])['is_occupied'].mean().reset_index()
-        
-        if not pivot_data.empty:
-            pivot_table = pivot_data.pivot(index='day', columns='hour', values='is_occupied')
-            
-            # Ensure all hours 0-23 exist
-            for hour in range(24):
-                if hour not in pivot_table.columns:
-                    pivot_table[hour] = 0
-            
-            pivot_table = pivot_table.reindex(sorted(pivot_table.columns), axis=1)
-            
-            # Order days properly
-            day_order = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
-            existing_days = [d for d in day_order if d in pivot_table.index]
-            if existing_days:
-                pivot_table = pivot_table.reindex(existing_days)
-            pivot_table = pivot_table.fillna(0)
-
-            # Create heatmap
-            fig_heatmap = go.Figure(data=go.Heatmap(
-                z=pivot_table.values,
-                x=list(range(24)),
-                y=pivot_table.index.tolist(),
-                colorscale='RdYlGn_r',
-                colorbar=dict(title='Occupancy Rate'),
-                hoverongaps=False,
-                hovertemplate='Day: %{y}<br>Hour: %{x}:00<br>Occupancy: %{z:.1%}<extra></extra>',
-                zmin=0,
-                zmax=1
-            ))
-
-            fig_heatmap.update_layout(
-                title='Last 24 Hours Utilization Pattern by Hour and Day',
-                xaxis_title='Hour of Day',
-                yaxis_title='Day of Week',
-                height=400,
-                xaxis=dict(tickmode='linear', tick0=0, dtick=1)
-            )
-
-            st.plotly_chart(fig_heatmap, use_container_width=True)
-        else:
-            st.warning("No hourly pattern data available")
+    # Filter data based on time range
+    now = datetime.now()
+    if time_range == "Last 6 Hours":
+        time_filter = now - timedelta(hours=6)
+    elif time_range == "Last 12 Hours":
+        time_filter = now - timedelta(hours=12)
+    elif time_range == "Last 24 Hours":
+        time_filter = now - timedelta(hours=24)
+    elif time_range == "Last 7 Days":
+        time_filter = now - timedelta(days=7)
     else:
-        st.warning("No historical utilization data available")
+        time_filter = utilization_df['timestamp'].min() if not utilization_df.empty else now - timedelta(days=1)
+
+    # Filter datasets
+    filtered_util = utilization_df[
+        utilization_df['timestamp'] >= time_filter] if not utilization_df.empty else utilization_df
+    filtered_hourly = hourly_df[hourly_df['hourly_timestamp'] >= time_filter] if not hourly_df.empty else hourly_df
+    filtered_sessions = sessions_df[sessions_df['end_time'] >= time_filter] if not sessions_df.empty else sessions_df
+
+    # Heatmap button
+    if st.button("📊 Show 24-Hour Utilization Heatmap", type="primary"):
+        st.subheader("Last 24 Hours Utilization Heatmap")
+        
+        if not historical_util_df.empty:
+            # Prepare data for heatmap
+            heatmap_data = historical_util_df.copy()
+            heatmap_data['hour'] = heatmap_data['timestamp'].dt.hour
+            heatmap_data['day'] = heatmap_data['timestamp'].dt.day_name()
+            
+            # Calculate occupancy rate for each day-hour combination
+            pivot_data = heatmap_data.groupby(['day', 'hour'])['is_occupied'].mean().reset_index()
+            
+            if not pivot_data.empty:
+                pivot_table = pivot_data.pivot(index='day', columns='hour', values='is_occupied')
+                
+                # Ensure all hours 0-23 exist
+                for hour in range(24):
+                    if hour not in pivot_table.columns:
+                        pivot_table[hour] = 0
+                
+                pivot_table = pivot_table.reindex(sorted(pivot_table.columns), axis=1)
+                
+                # Order days properly
+                day_order = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+                existing_days = [d for d in day_order if d in pivot_table.index]
+                if existing_days:
+                    pivot_table = pivot_table.reindex(existing_days)
+                pivot_table = pivot_table.fillna(0)
+
+                # Create custom colorscale optimized for low occupancy rates
+                # Based on: 15% average, 25% high occupancy
+                # Scale colors more aggressively for low values
+                custom_colorscale = [
+                    [0.0, '#27ae60'],     # 0% - Dark green (fully available)
+                    [0.05, '#2ecc71'],    # ~2% - Green 
+                    [0.15, '#f1c40f'],    # ~6% - Yellow (low usage)
+                    [0.35, '#f39c12'],    # ~14% - Orange (approaching average)
+                    [0.5, '#e67e22'],     # ~20% - Dark orange (above average)
+                    [0.7, '#e74c3c'],     # ~28% - Red (high usage)
+                    [0.85, '#c0392b'],    # ~34% - Dark red (very high)
+                    [1.0, '#8b0000']      # 40%+ - Very dark red (extremely high)
+                ]
+
+                # Create heatmap with adjusted color scale for better sensitivity
+                fig_heatmap = go.Figure(data=go.Heatmap(
+                    z=pivot_table.values,
+                    x=list(range(24)),
+                    y=pivot_table.index.tolist(),
+                    colorscale=custom_colorscale,
+                    colorbar=dict(
+                        title='Occupancy Rate',
+                        tickmode='array',
+                        tickvals=[0, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40],
+                        ticktext=['0%', '5%', '10%', '15%', '20%', '25%', '30%', '35%', '40%+'],
+                        titleside='right'
+                    ),
+                    hoverongaps=False,
+                    hovertemplate='Day: %{y}<br>Hour: %{x}:00<br>Occupancy: %{z:.1%}<extra></extra>',
+                    zmin=0,
+                    zmax=0.40  # Cap at 40% to make colors shift more rapidly for typical usage
+                ))
+
+                fig_heatmap.update_layout(
+                    title='Last 24 Hours Utilization Pattern by Hour and Day<br><sub>Colors optimized for typical 15% average occupancy</sub>',
+                    xaxis_title='Hour of Day',
+                    yaxis_title='Day of Week',
+                    height=500,
+                    xaxis=dict(tickmode='linear', tick0=0, dtick=1),
+                    font=dict(size=12)
+                )
+
+                st.plotly_chart(fig_heatmap, use_container_width=True)
+                
+                # Add interpretation guide
+                st.info("""
+                **Color Guide for Occupancy Rates:**
+                - 🟢 **Green (0-5%)**: Very low usage, many available connectors
+                - 🟡 **Yellow (5-15%)**: Normal usage, around average occupancy
+                - 🟠 **Orange (15-25%)**: Above average usage, moderate demand
+                - 🔴 **Red (25%+)**: High usage, limited availability
+                """)
+                
+                # Show statistics
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    peak_occupancy = pivot_table.values.max()
+                    st.metric("Peak Occupancy", f"{peak_occupancy:.1%}")
+                with col2:
+                    avg_occupancy = pivot_table.values.mean()
+                    st.metric("Average Occupancy", f"{avg_occupancy:.1%}")
+                with col3:
+                    # Find peak hour
+                    hourly_avg = pivot_table.mean(axis=0)
+                    peak_hour = hourly_avg.idxmax()
+                    st.metric("Peak Hour", f"{peak_hour}:00", f"{hourly_avg[peak_hour]:.1%}")
+                    
+            else:
+                st.warning("No hourly pattern data available")
+        else:
+            st.warning("No historical utilization data available")
 
     # Create tabs for additional analytics
     tab1, tab2, tab3 = st.tabs(["📈 Trends", "⚡ Power & Revenue", "💰 Session Analysis"])
 
     with tab1:
+        # Peak hours analysis
+        col1, col2 = st.columns(2)
+
+        with col1:
+            if not filtered_sessions.empty and 'start_time' in filtered_sessions.columns:
+                peak_hour_sessions = filtered_sessions.groupby(filtered_sessions['start_time'].dt.hour).size()
+                if not peak_hour_sessions.empty:
+                    peak_hour = peak_hour_sessions.idxmax()
+                    peak_count = peak_hour_sessions.max()
+                    st.metric("Peak Hour (Sessions)", f"{peak_hour}:00", f"{peak_count} sessions started")
+                else:
+                    st.metric("Peak Hour (Sessions)", "No data", "0 sessions")
+            else:
+                st.metric("Peak Hour (Sessions)", "No data", "0 sessions")
+
+        with col2:
+            if not filtered_sessions.empty:
+                total_completed = len(filtered_sessions)
+                current_active = len(filtered_util[filtered_util['is_occupied'] == 1]) if not filtered_util.empty else 0
+                st.metric("Sessions", f"{total_completed} completed", f"{current_active} active now")
+            else:
+                current_active = len(filtered_util[filtered_util['is_occupied'] == 1]) if not filtered_util.empty else 0
+                st.metric("Sessions", "0 completed", f"{current_active} active now")
+
         # Utilization trends
         st.subheader("Utilization Trends")
 
-        if not hourly_df.empty:
+        if not filtered_hourly.empty:
             # Multi-metric trend chart
-            trend_data = hourly_df.groupby('hourly_timestamp').agg({
+            trend_data = filtered_hourly.groupby('hourly_timestamp').agg({
                 'total_occupied': 'sum',
                 'total_available': 'sum',
                 'avg_occupancy_rate': 'mean'
@@ -1075,22 +1172,22 @@ def show_utilization_analytics(utilization_df, hourly_df, sessions_df, historica
         # Power and Revenue Analysis
         st.subheader("Power Consumption & Revenue Analysis")
 
-        if not sessions_df.empty:
+        if not filtered_sessions.empty:
             # Ensure we have connector type data
-            if 'connector_type' not in sessions_df.columns:
+            if 'connector_type' not in filtered_sessions.columns:
                 # Try to get connector type from utilization data
-                if not utilization_df.empty and 'connector_type' in utilization_df.columns:
-                    connector_types = utilization_df.groupby('connector_id')['connector_type'].first()
-                    sessions_df = sessions_df.merge(
+                if not filtered_util.empty and 'connector_type' in filtered_util.columns:
+                    connector_types = filtered_util.groupby('connector_id')['connector_type'].first()
+                    filtered_sessions = filtered_sessions.merge(
                         connector_types, left_on='connector_id', right_index=True, how='left'
                     )
                 else:
                     # Create mock connector types based on connector_id patterns
-                    sessions_df['connector_type'] = 'Type2'  # Default fallback
+                    filtered_sessions['connector_type'] = 'Type2'  # Default fallback
 
             # Group by connector type
-            if 'connector_type' in sessions_df.columns:
-                type_stats = sessions_df.groupby('connector_type').agg({
+            if 'connector_type' in filtered_sessions.columns:
+                type_stats = filtered_sessions.groupby('connector_type').agg({
                     'energy_kwh': ['sum', 'mean'],
                     'revenue_nok': ['sum', 'mean'],
                     'duration_hours': 'mean',
@@ -1134,19 +1231,19 @@ def show_utilization_analytics(utilization_df, hourly_df, sessions_df, historica
             col1, col2, col3, col4 = st.columns(4)
 
             with col1:
-                total_energy = sessions_df['energy_kwh'].sum()
+                total_energy = filtered_sessions['energy_kwh'].sum()
                 st.metric("Total Energy Delivered", f"{total_energy:,.0f} kWh")
 
             with col2:
-                total_revenue = sessions_df['revenue_nok'].sum()
+                total_revenue = filtered_sessions['revenue_nok'].sum()
                 st.metric("Total Revenue", f"NOK {total_revenue:,.0f}", f"${total_revenue / 10.5:,.0f} USD")
 
             with col3:
-                avg_session_revenue = sessions_df['revenue_nok'].mean()
+                avg_session_revenue = filtered_sessions['revenue_nok'].mean()
                 st.metric("Avg Revenue/Session", f"NOK {avg_session_revenue:.1f}")
 
             with col4:
-                avg_duration = sessions_df['duration_hours'].mean() * 60
+                avg_duration = filtered_sessions['duration_hours'].mean() * 60
                 st.metric("Avg Session Duration", f"{avg_duration:.0f} min")
 
         else:
@@ -1156,14 +1253,14 @@ def show_utilization_analytics(utilization_df, hourly_df, sessions_df, historica
         # Session Analysis
         st.subheader("Detailed Session Analysis")
 
-        if not sessions_df.empty:
+        if not filtered_sessions.empty:
             # Session duration and revenue distributions
             col1, col2 = st.columns(2)
 
             with col1:
                 # Duration histogram
                 fig_duration = px.histogram(
-                    sessions_df,
+                    filtered_sessions,
                     x='duration_hours',
                     nbins=20,
                     title='Session Duration Distribution',
@@ -1175,7 +1272,7 @@ def show_utilization_analytics(utilization_df, hourly_df, sessions_df, historica
             with col2:
                 # Revenue per session histogram
                 fig_revenue_dist = px.histogram(
-                    sessions_df,
+                    filtered_sessions,
                     x='revenue_nok',
                     nbins=20,
                     title='Revenue per Session Distribution',
