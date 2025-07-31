@@ -34,6 +34,7 @@ For this project, **free tools and services** like Streamlit and Railway are use
 - The API, combined with 1-minute extracts, creates thousands of rows. After an hour, the database can have millions of records.  
   👉 Because of that, I have to delete records quite often.
 - The **responsiveness of the free Streamlit app**: The app has lots of functionality and can handle a lot of data, which can make the webpage slow.
+- The revenue and power analysis in this dashboard are not made for very accurate analysis, since the API does not provide the power usage, only the maximum power for the connector. The numbers calculated from the time of the sessions that were caught by the script and being multiplied by MAX power connector can deliver. In real real-world scenario, any fluctuation in power or the connector working half of its max would be unnoticed, that is why only use these metrics for the sake of possible but not precise estimation.
 
 > **Note:**  
 > If some parts don't load, just click the button again. If it's still showing the previous page, switch to any other page and click the button you're interested in.
