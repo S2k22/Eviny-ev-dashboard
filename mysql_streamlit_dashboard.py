@@ -222,21 +222,38 @@ def load_stations_data():
 
 @st.cache_data(ttl=60)
 def load_utilization_data():
-    """Load latest 24 hours utilization data"""
-    query = """
-    SELECT 
-        timestamp, hourly_timestamp, station_id, connector_id, connector_type,
-        power, status, is_occupied, is_available, is_out_of_order, tariff
-    FROM utilization_data
-    WHERE timestamp >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
-    ORDER BY timestamp DESC
-    """
-    
+    """Load latest available 24 hours of utilization data"""
     try:
-        df = pd.read_sql(query, engine)
+        # First, find the latest timestamp in the data
+        latest_query = "SELECT MAX(timestamp) as latest_time FROM utilization_data"
+        latest_result = pd.read_sql(latest_query, engine)
+        
+        if latest_result.empty or latest_result['latest_time'].iloc[0] is None:
+            st.warning("No utilization data found in database")
+            return pd.DataFrame()
+        
+        latest_time = latest_result['latest_time'].iloc[0]
+        
+        # Calculate 24 hours before the latest timestamp
+        query = """
+        SELECT 
+            timestamp, hourly_timestamp, station_id, connector_id, connector_type,
+            power, status, is_occupied, is_available, is_out_of_order, tariff
+        FROM utilization_data
+        WHERE timestamp >= DATE_SUB(%s, INTERVAL 24 HOUR)
+        ORDER BY timestamp DESC
+        """
+        
+        df = pd.read_sql(query, engine, params=[latest_time])
         if not df.empty:
             df['timestamp'] = pd.to_datetime(df['timestamp'])
             df['hourly_timestamp'] = pd.to_datetime(df['hourly_timestamp'])
+            
+            # Log the data period for debugging
+            data_start = df['timestamp'].min()
+            data_end = df['timestamp'].max()
+            st.sidebar.info(f"📊 Utilization Data Period: {data_start.strftime('%Y-%m-%d %H:%M')} to {data_end.strftime('%Y-%m-%d %H:%M')}")
+            
         return df
     except Exception as e:
         st.error(f"Error loading utilization data: {e}")
@@ -244,20 +261,37 @@ def load_utilization_data():
 
 @st.cache_data(ttl=60)
 def load_hourly_data():
-    """Load hourly aggregated data for last 24 hours"""
-    query = """
-    SELECT 
-        hourly_timestamp, station_id, is_available, is_occupied, 
-        is_out_of_order, total_connectors, occupancy_rate, availability_rate
-    FROM hourly_utilization
-    WHERE hourly_timestamp >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
-    ORDER BY hourly_timestamp DESC
-    """
-    
+    """Load latest available 24 hours of hourly aggregated data"""
     try:
-        df = pd.read_sql(query, engine)
+        # First, find the latest timestamp in hourly data
+        latest_query = "SELECT MAX(hourly_timestamp) as latest_time FROM hourly_utilization"
+        latest_result = pd.read_sql(latest_query, engine)
+        
+        if latest_result.empty or latest_result['latest_time'].iloc[0] is None:
+            st.warning("No hourly utilization data found in database")
+            return pd.DataFrame()
+        
+        latest_time = latest_result['latest_time'].iloc[0]
+        
+        # Get 24 hours of data from the latest available timestamp
+        query = """
+        SELECT 
+            hourly_timestamp, station_id, is_available, is_occupied, 
+            is_out_of_order, total_connectors, occupancy_rate, availability_rate
+        FROM hourly_utilization
+        WHERE hourly_timestamp >= DATE_SUB(%s, INTERVAL 24 HOUR)
+        ORDER BY hourly_timestamp DESC
+        """
+        
+        df = pd.read_sql(query, engine, params=[latest_time])
         if not df.empty:
             df['hourly_timestamp'] = pd.to_datetime(df['hourly_timestamp'])
+            
+            # Log the data period for debugging
+            data_start = df['hourly_timestamp'].min()
+            data_end = df['hourly_timestamp'].max()
+            st.sidebar.info(f"⏱️ Hourly Data Period: {data_start.strftime('%Y-%m-%d %H:%M')} to {data_end.strftime('%Y-%m-%d %H:%M')}")
+            
         return df
     except Exception as e:
         st.error(f"Error loading hourly data: {e}")
@@ -265,45 +299,77 @@ def load_hourly_data():
 
 @st.cache_data(ttl=60)
 def load_sessions_data():
-    """Load charging sessions for last 24 hours"""
-    query = """
-    SELECT 
-        s.connector_id, s.station_id, s.start_time, s.end_time,
-        s.duration_hours, s.energy_kwh, s.revenue_nok,
-        st.name as station_name, st.address as station_address
-    FROM charging_sessions s
-    LEFT JOIN charging_stations st ON s.station_id = st.id
-    WHERE s.end_time >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
-    ORDER BY s.end_time DESC
-    """
-    
+    """Load latest available 24 hours of charging sessions"""
     try:
-        df = pd.read_sql(query, engine)
+        # First, find the latest end_time in sessions data
+        latest_query = "SELECT MAX(end_time) as latest_time FROM charging_sessions"
+        latest_result = pd.read_sql(latest_query, engine)
+        
+        if latest_result.empty or latest_result['latest_time'].iloc[0] is None:
+            st.warning("No charging sessions found in database")
+            return pd.DataFrame()
+        
+        latest_time = latest_result['latest_time'].iloc[0]
+        
+        # Get 24 hours of session data from the latest available timestamp
+        query = """
+        SELECT 
+            s.connector_id, s.station_id, s.start_time, s.end_time,
+            s.duration_hours, s.energy_kwh, s.revenue_nok,
+            st.name as station_name, st.address as station_address
+        FROM charging_sessions s
+        LEFT JOIN charging_stations st ON s.station_id = st.id
+        WHERE s.end_time >= DATE_SUB(%s, INTERVAL 24 HOUR)
+        ORDER BY s.end_time DESC
+        """
+        
+        df = pd.read_sql(query, engine, params=[latest_time])
         if not df.empty:
             df['start_time'] = pd.to_datetime(df['start_time'])
             df['end_time'] = pd.to_datetime(df['end_time'])
+            
+            # Log the data period for debugging
+            data_start = df['end_time'].min()
+            data_end = df['end_time'].max()
+            st.sidebar.info(f"🔌 Sessions Data Period: {data_start.strftime('%Y-%m-%d %H:%M')} to {data_end.strftime('%Y-%m-%d %H:%M')}")
+            
         return df
     except Exception as e:
         st.error(f"Error loading sessions data: {e}")
         return pd.DataFrame()
 
 def get_latest_connector_status():
-    """Get latest status for each connector"""
-    query = """
-    SELECT u1.*
-    FROM utilization_data u1
-    INNER JOIN (
-        SELECT connector_id, MAX(timestamp) as max_timestamp
-        FROM utilization_data
-        WHERE timestamp >= DATE_SUB(NOW(), INTERVAL 2 HOUR)
-        GROUP BY connector_id
-    ) u2 ON u1.connector_id = u2.connector_id AND u1.timestamp = u2.max_timestamp
-    """
-    
+    """Get latest status for each connector from the most recent available data"""
     try:
-        df = pd.read_sql(query, engine)
+        # First, find the latest timestamp in utilization data
+        latest_query = "SELECT MAX(timestamp) as latest_time FROM utilization_data"
+        latest_result = pd.read_sql(latest_query, engine)
+        
+        if latest_result.empty or latest_result['latest_time'].iloc[0] is None:
+            return pd.DataFrame()
+        
+        latest_time = latest_result['latest_time'].iloc[0]
+        
+        # Get latest status for each connector within the last 2 hours from latest data
+        query = """
+        SELECT u1.*
+        FROM utilization_data u1
+        INNER JOIN (
+            SELECT connector_id, MAX(timestamp) as max_timestamp
+            FROM utilization_data
+            WHERE timestamp >= DATE_SUB(%s, INTERVAL 2 HOUR)
+            GROUP BY connector_id
+        ) u2 ON u1.connector_id = u2.connector_id AND u1.timestamp = u2.max_timestamp
+        """
+        
+        df = pd.read_sql(query, engine, params=[latest_time])
         if not df.empty:
             df['timestamp'] = pd.to_datetime(df['timestamp'])
+            
+            # Log latest connector status time
+            latest_status_time = df['timestamp'].max()
+            st.sidebar.success(f"🔄 Latest Status: {latest_status_time.strftime('%Y-%m-%d %H:%M:%S')}")
+            
         return df
     except Exception as e:
         st.error(f"Error loading latest connector status: {e}")
@@ -364,7 +430,27 @@ def main():
         
         st.markdown("---")
         st.markdown("### ⏱️ Data Status")
-        st.info(f"Last updated: {get_oslo_time().strftime('%H:%M:%S')}")
+        
+        # Get data availability info
+        try:
+            # Check latest data timestamps
+            util_latest = pd.read_sql("SELECT MAX(timestamp) as latest FROM utilization_data", engine)['latest'].iloc[0]
+            sessions_latest = pd.read_sql("SELECT MAX(end_time) as latest FROM charging_sessions", engine)['latest'].iloc[0]
+            hourly_latest = pd.read_sql("SELECT MAX(hourly_timestamp) as latest FROM hourly_utilization", engine)['latest'].iloc[0]
+            
+            if util_latest:
+                age_hours = (datetime.now() - util_latest.replace(tzinfo=None)).total_seconds() / 3600
+                if age_hours < 2:
+                    st.success(f"🟢 Live ({age_hours:.1f}h ago)")
+                elif age_hours < 24:
+                    st.warning(f"🟡 Recent ({age_hours:.1f}h ago)")
+                else:
+                    st.info(f"🔵 Historical ({age_hours/24:.1f}d ago)")
+            else:
+                st.error("🔴 No data available")
+                
+        except Exception as e:
+            st.info(f"Last updated: {get_oslo_time().strftime('%H:%M:%S')}")
         
         # Quick stats
         st.markdown("### 📊 Quick Stats")
