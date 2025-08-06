@@ -21,7 +21,24 @@ import pytz
 import os
 from sqlalchemy import create_engine, text
 from urllib.parse import quote_plus
-import pymysql
+
+# Import MySQL connector with fallback options
+try:
+    import pymysql
+    pymysql.install_as_MySQLdb()  # This makes pymysql work as MySQLdb
+    MYSQL_DRIVER = "pymysql"
+except ImportError:
+    try:
+        import mysql.connector
+        MYSQL_DRIVER = "mysql+connector"
+    except ImportError:
+        try:
+            import MySQLdb
+            MYSQL_DRIVER = "mysqlclient"
+        except ImportError:
+            st.error("❌ No MySQL driver found. Please install one of: pymysql, mysql-connector-python, or mysqlclient")
+            st.info("Run: pip install pymysql")
+            st.stop()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -112,13 +129,17 @@ def get_mysql_config():
                     'database': st.secrets['MYSQL_DATABASE']
                 }
                 password = quote_plus(config['password'])
-                return f"mysql+pymysql://{config['user']}:{password}@{config['host']}:{config['port']}/{config['database']}?charset=utf8mb4"
+                return f"mysql+{MYSQL_DRIVER}://{config['user']}:{password}@{config['host']}:{config['port']}/{config['database']}?charset=utf8mb4"
     except:
         pass
     
     # Fallback to environment variables
     if os.getenv('DATABASE_URL'):
-        return os.getenv('DATABASE_URL').replace('mysql://', 'mysql+pymysql://')
+        db_url = os.getenv('DATABASE_URL')
+        # Replace mysql:// with the appropriate driver
+        if db_url.startswith('mysql://'):
+            db_url = db_url.replace('mysql://', f'mysql+{MYSQL_DRIVER}://')
+        return db_url
     
     # Build from individual components
     host = os.getenv('MYSQL_HOST', 'localhost')
@@ -127,7 +148,7 @@ def get_mysql_config():
     password = quote_plus(os.getenv('MYSQL_PASSWORD', ''))
     database = os.getenv('MYSQL_DATABASE', 'ev_charging_db')
     
-    return f"mysql+pymysql://{user}:{password}@{host}:{port}/{database}?charset=utf8mb4"
+    return f"mysql+{MYSQL_DRIVER}://{user}:{password}@{host}:{port}/{database}?charset=utf8mb4"
 
 @st.cache_resource
 def get_database_engine():
