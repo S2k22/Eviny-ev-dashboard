@@ -1,3 +1,8 @@
+"""
+EV Charging Analytics Dashboard - Optimized for Railway MySQL
+Professional dashboard with real-time data visualization and analytics
+"""
+
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -10,7 +15,7 @@ from datetime import datetime, timedelta
 import time
 import logging
 import re
-from zoneinfo import ZoneInfo
+import pytz
 
 # MySQL Connection Setup
 import os
@@ -18,723 +23,440 @@ from sqlalchemy import create_engine, text
 from urllib.parse import quote_plus
 import pymysql
 
-
-def get_cest_time() -> datetime:
-    """Return current time in CEST (Europe/Oslo)."""
-    return datetime.now(ZoneInfo("Europe/Oslo"))
-
-
-def get_mysql_config():
-    """Get MySQL configuration from Streamlit secrets or environment variables"""
-    # Try Streamlit secrets first (for Streamlit Cloud)
-    try:
-        if hasattr(st, 'secrets') and 'DATABASE_URL' in st.secrets:
-            os.environ['DATABASE_URL'] = st.secrets['DATABASE_URL']
-        elif hasattr(st, 'secrets') and 'MYSQL_HOST' in st.secrets:
-            for key in ['MYSQL_HOST', 'MYSQL_PORT', 'MYSQL_USER', 'MYSQL_PASSWORD', 'MYSQL_DATABASE']:
-                if key in st.secrets:
-                    os.environ[key] = str(st.secrets[key])
-    except Exception as e:
-        pass  # Silently fall back to environment variables
-
-    # Fallback to environment variables
-    return {
-        'host': os.getenv('MYSQL_HOST', 'localhost'),
-        'port': int(os.getenv('MYSQL_PORT', 3306)),
-        'user': os.getenv('MYSQL_USER', 'root'),
-        'password': os.getenv('MYSQL_PASSWORD', ''),
-        'database': os.getenv('MYSQL_DATABASE', 'ev_charging'),
-        'charset': 'utf8mb4'
-    }
-
-
-def get_connection_string():
-    """Get MySQL connection string"""
-    # Check if DATABASE_URL is provided (Railway/PlanetScale format)
-    if os.getenv('DATABASE_URL'):
-        return os.getenv('DATABASE_URL').replace('mysql://', 'mysql+pymysql://')
-
-    # Otherwise build from components
-    config = get_mysql_config()
-    password = quote_plus(config['password'])
-    return (
-        f"mysql+pymysql://{config['user']}:{password}@"
-        f"{config['host']}:{config['port']}/{config['database']}"
-        f"?charset={config['charset']}"
-    )
-
-
-def get_engine():
-    """Create SQLAlchemy engine with connection pooling"""
-    try:
-        return create_engine(
-            get_connection_string(),
-            pool_size=3,
-            max_overflow=5,
-            pool_timeout=30,
-            pool_recycle=3600,
-            pool_pre_ping=True,
-            echo=False
-        )
-    except Exception as e:
-        logger.error(f"Failed to create database engine: {e}")
-        return None
-
-
-# Set up logging
+# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Create global engine instance
-try:
-    engine = get_engine()
-    MYSQL_AVAILABLE = engine is not None
-except Exception as e:
-    engine = None
-    MYSQL_AVAILABLE = False
-
-
-# MySQL Data Loading Functions
-def load_from_mysql(table_name, where_clause=None, limit=None):
-    """Load data from MySQL table"""
-    if not MYSQL_AVAILABLE or engine is None:
-        return pd.DataFrame()
-
-    try:
-        query = f"SELECT * FROM {table_name}"
-
-        if where_clause:
-            query += f" WHERE {where_clause}"
-
-        if limit:
-            query += f" LIMIT {limit}"
-
-        df = pd.read_sql(query, engine)
-
-        # Parse datetime columns
-        datetime_columns = ['timestamp', 'hourly_timestamp', 'start_time', 'end_time', 'created_at', 'last_updated']
-        for col in datetime_columns:
-            if col in df.columns:
-                df[col] = pd.to_datetime(df[col])
-
-        return df
-
-    except Exception as e:
-        logger.error(f"Error loading from MySQL table {table_name}: {e}")
-        return pd.DataFrame()
-
-
-def get_latest_utilization():
-    """Get the latest utilization status for each connector"""
-    if not MYSQL_AVAILABLE:
-        return pd.DataFrame()
-
-    try:
-        # Try to use a view if it exists, otherwise get latest records manually
-        query = """
-        SELECT u1.* FROM utilization_data u1
-        INNER JOIN (
-            SELECT connector_id, MAX(timestamp) as max_timestamp
-            FROM utilization_data
-            WHERE timestamp >= DATE_SUB(NOW(), INTERVAL 2 HOUR)
-            GROUP BY connector_id
-        ) u2 ON u1.connector_id = u2.connector_id AND u1.timestamp = u2.max_timestamp
-        """
-        return pd.read_sql(query, engine)
-    except Exception as e:
-        logger.error(f"Error getting latest utilization: {e}")
-        # Fallback to recent data
-        return load_from_mysql('utilization_data',
-                               where_clause="timestamp >= DATE_SUB(NOW(), INTERVAL 1 HOUR)")
-
-
-def get_historical_utilization(hours=24):
-    """Get ALL historical utilization data for the specified time period"""
-    if not MYSQL_AVAILABLE:
-        return pd.DataFrame()
-
-    try:
-        query = """
-        SELECT * FROM utilization_data
-        WHERE timestamp >= DATE_SUB(NOW(), INTERVAL %s HOUR)
-        ORDER BY timestamp DESC
-        """
-        df = pd.read_sql(query, engine, params=(hours,))
-
-        # Parse datetime columns
-        if 'timestamp' in df.columns:
-            df['timestamp'] = pd.to_datetime(df['timestamp'])
-        if 'hourly_timestamp' in df.columns:
-            df['hourly_timestamp'] = pd.to_datetime(df['hourly_timestamp'])
-
-        return df
-    except Exception as e:
-        logger.error(f"Error getting historical utilization: {e}")
-        return pd.DataFrame()
-
-
-def get_hourly_stats(hours=24):
-    """Get hourly statistics for the last N hours"""
-    if not MYSQL_AVAILABLE:
-        return pd.DataFrame()
-
-    try:
-        query = """
-        SELECT 
-            hourly_timestamp,
-            SUM(is_occupied) as total_occupied,
-            SUM(is_available) as total_available,
-            SUM(is_out_of_order) as total_out_of_order,
-            COUNT(*) as total_connectors,
-            AVG(CASE WHEN is_occupied = 1 THEN 1.0 ELSE 0.0 END) as avg_occupancy_rate
-        FROM hourly_utilization
-        WHERE hourly_timestamp >= DATE_SUB(NOW(), INTERVAL %s HOUR)
-        GROUP BY hourly_timestamp
-        ORDER BY hourly_timestamp DESC
-        """
-        return pd.read_sql(query, engine, params=(hours,))
-    except Exception as e:
-        logger.error(f"Error getting hourly stats: {e}")
-        # Fallback to utilization data aggregation
-        return load_from_mysql('utilization_data',
-                               where_clause=f"timestamp >= DATE_SUB(NOW(), INTERVAL {hours} HOUR)")
-
-
-def get_recent_sessions(hours=24):
-    """Get charging sessions from the last N hours"""
-    if not MYSQL_AVAILABLE:
-        return pd.DataFrame()
-
-    try:
-        query = """
-        SELECT 
-            cs.*,
-            st.name as station_name,
-            st.address as station_address
-        FROM charging_sessions cs
-        LEFT JOIN charging_stations st ON cs.station_id = st.id
-        WHERE cs.end_time >= DATE_SUB(NOW(), INTERVAL %s HOUR)
-        ORDER BY cs.end_time DESC
-        """
-        return pd.read_sql(query, engine, params=[hours])
-    except Exception as e:
-        logger.error(f"Error getting recent sessions: {e}")
-        # Fallback to sessions table without join
-        return load_from_mysql('charging_sessions',
-                               where_clause=f"end_time >= DATE_SUB(NOW(), INTERVAL {hours} HOUR)")
-
-
-def test_mysql_connection():
-    """Test MySQL connection and return status"""
-    if not MYSQL_AVAILABLE or engine is None:
-        return False, "Engine not available"
-
-    try:
-        with engine.connect() as conn:
-            result = conn.execute(text("SELECT 1"))
-            return True, "Connected successfully"
-    except Exception as e:
-        return False, str(e)
-
-
 # Page configuration
 st.set_page_config(
-    page_title="EV Charging Analytics Dashboard",
+    page_title="EV Charging Analytics",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# Set dark theme as default
+# Custom CSS for professional styling
 st.markdown("""
 <style>
     .main-header {
-        font-size: 3rem;
+        font-size: 2.5rem;
         color: #1f77b4;
         text-align: center;
-        margin-bottom: 2rem;
+        margin-bottom: 1rem;
+        font-weight: 600;
     }
     .metric-card {
-        background-color: #f0f2f6;
+        background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
         padding: 1rem;
         border-radius: 0.5rem;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        margin: 0.5rem 0;
     }
     .stTabs [data-baseweb="tab-list"] button [data-testid="stMarkdownContainer"] p {
-        font-size: 1.2rem;
-    }
-    .refresh-timer {
-        position: fixed;
-        top: 70px;
-        right: 20px;
-        background-color: #f0f2f6;
-        padding: 5px 10px;
-        border-radius: 5px;
-        font-size: 0.8rem;
-        z-index: 999;
+        font-size: 1.1rem;
+        font-weight: 500;
     }
     .station-card {
         border-radius: 10px;
         padding: 15px;
         margin: 5px;
         text-align: center;
-        height: 180px;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        transition: transform 0.2s;
+    }
+    .station-card:hover {
+        transform: translateY(-2px);
+    }
+    .status-indicator {
+        width: 12px;
+        height: 12px;
+        border-radius: 50%;
+        display: inline-block;
+        margin-right: 8px;
+    }
+    .refresh-info {
+        position: fixed;
+        top: 70px;
+        right: 20px;
+        background: rgba(255,255,255,0.9);
+        padding: 8px 15px;
+        border-radius: 20px;
+        box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        font-size: 0.8rem;
+        z-index: 999;
+    }
+    .kpi-container {
+        background: white;
+        padding: 1.5rem;
+        border-radius: 10px;
+        box-shadow: 0 2px 10px rgba(0,0,0,0.05);
+        margin: 1rem 0;
     }
 </style>
 """, unsafe_allow_html=True)
 
-# Import timezone handling
-import pytz
-
-# Set CEST timezone
-CEST = pytz.timezone('Europe/Oslo')
-
-# Session state initialization with better navigation handling
-if 'current_page' not in st.session_state:
-    st.session_state.current_page = "📊 Overview"
-if 'last_refresh' not in st.session_state:
-    st.session_state.last_refresh = time.time()
-if 'auto_refresh_enabled' not in st.session_state:
-    st.session_state.auto_refresh_enabled = True
-if 'data_loaded' not in st.session_state:
-    st.session_state.data_loaded = False
-
-# Changed refresh interval from 30 to 60 seconds
-REFRESH_INTERVAL = 60
-
-
-@st.cache_data(ttl=60, show_spinner=False)
-def load_utilization_data():
-    """Load latest utilization data from MySQL, fallback to older data if recent not available"""
-    if not MYSQL_AVAILABLE or engine is None:
-        st.error("❌ Database connection required. Please configure MySQL credentials.")
-        st.stop()
-
+# Database Configuration
+def get_mysql_config():
+    """Get MySQL configuration from environment or Streamlit secrets"""
     try:
-        df = get_latest_utilization()
-        if df.empty:
-            # Fallback: Try to get ANY utilization data from database
-            df = load_from_mysql('utilization_data', limit=1000)  # Get last 1000 records
-            if df.empty:
-                st.warning("⚠️ No utilization data found in database.")
-                st.stop()
-            else:
-                st.info("📡 Displaying older utilization data (recent data not available)")
-        return df
-    except Exception as e:
-        st.error(f"❌ Error loading utilization data: {e}")
-        st.stop()
+        # Try Streamlit secrets first
+        if hasattr(st, 'secrets'):
+            if 'DATABASE_URL' in st.secrets:
+                return st.secrets['DATABASE_URL']
+            elif all(key in st.secrets for key in ['MYSQL_HOST', 'MYSQL_USER', 'MYSQL_PASSWORD', 'MYSQL_DATABASE']):
+                config = {
+                    'host': st.secrets['MYSQL_HOST'],
+                    'port': int(st.secrets.get('MYSQL_PORT', 3306)),
+                    'user': st.secrets['MYSQL_USER'],
+                    'password': st.secrets['MYSQL_PASSWORD'],
+                    'database': st.secrets['MYSQL_DATABASE']
+                }
+                password = quote_plus(config['password'])
+                return f"mysql+pymysql://{config['user']}:{password}@{config['host']}:{config['port']}/{config['database']}?charset=utf8mb4"
+    except:
+        pass
+    
+    # Fallback to environment variables
+    if os.getenv('DATABASE_URL'):
+        return os.getenv('DATABASE_URL').replace('mysql://', 'mysql+pymysql://')
+    
+    # Build from individual components
+    host = os.getenv('MYSQL_HOST', 'localhost')
+    port = int(os.getenv('MYSQL_PORT', 3306))
+    user = os.getenv('MYSQL_USER', 'root')
+    password = quote_plus(os.getenv('MYSQL_PASSWORD', ''))
+    database = os.getenv('MYSQL_DATABASE', 'ev_charging_db')
+    
+    return f"mysql+pymysql://{user}:{password}@{host}:{port}/{database}?charset=utf8mb4"
 
-
-@st.cache_data(ttl=60, show_spinner=False)
-def load_historical_utilization_data(hours=24):
-    """Load historical utilization data for heatmap and analytics, fallback to older data"""
-    if not MYSQL_AVAILABLE or engine is None:
-        st.error("❌ Database connection required. Please configure MySQL credentials.")
-        st.stop()
-
+@st.cache_resource
+def get_database_engine():
+    """Create and cache database engine"""
     try:
-        df = get_historical_utilization(hours)
-        if df.empty:
-            # Fallback: Try to get ANY historical data
-            df = load_from_mysql('utilization_data', limit=5000)  # Get more records for analysis
-            if df.empty:
-                st.warning("⚠️ No historical utilization data found in database.")
-                return pd.DataFrame()
-            else:
-                st.info(f"📡 Displaying older historical data (last {hours}h not available)")
-        return df
+        connection_string = get_mysql_config()
+        engine = create_engine(
+            connection_string,
+            pool_size=5,
+            max_overflow=10,
+            pool_timeout=30,
+            pool_recycle=3600,
+            pool_pre_ping=True,
+            echo=False
+        )
+        # Test connection
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        return engine
     except Exception as e:
-        st.error(f"❌ Error loading historical utilization data: {e}")
-        return pd.DataFrame()
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def load_hourly_data():
-    """Load hourly aggregated data from MySQL, fallback to older data"""
-    if not MYSQL_AVAILABLE or engine is None:
-        st.error("❌ Database connection required. Please configure MySQL credentials.")
+        st.error(f"❌ Database connection failed: {e}")
+        st.info("Please check your database credentials in Streamlit secrets or environment variables")
         st.stop()
 
-    try:
-        df = get_hourly_stats(hours=168)  # Last 7 days
-        if df.empty:
-            # Fallback: Try to get ANY hourly data
-            df = load_from_mysql('hourly_utilization', limit=1000)
-            if df.empty:
-                st.warning("⚠️ No hourly data found in database.")
-                st.stop()
-            else:
-                st.info("📡 Displaying older hourly data (last 7 days not available)")
-        return df
-    except Exception as e:
-        st.error(f"❌ Error loading hourly data: {e}")
-        st.stop()
+# Initialize database engine
+engine = get_database_engine()
 
+# Timezone setup
+OSLO_TZ = pytz.timezone('Europe/Oslo')
 
-@st.cache_data(ttl=60, show_spinner=False)
-def load_stations_data():
-    """Load charging stations data from MySQL"""
-    if not MYSQL_AVAILABLE or engine is None:
-        st.error("❌ Database connection required. Please configure MySQL credentials.")
-        st.stop()
+def get_oslo_time():
+    """Get current time in Oslo timezone"""
+    return datetime.now(OSLO_TZ)
 
-    try:
-        df = load_from_mysql('charging_stations')
-        if df.empty:
-            st.warning("⚠️ No stations data found in database.")
-            st.stop()
-
-        # Ensure numeric columns are properly typed
-        numeric_cols = ['latitude', 'longitude', 'total_connectors', 'ccs_connectors',
-                        'chademo_connectors', 'type2_connectors', 'other_connectors']
-        for col in numeric_cols:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors='coerce')
-        return df
-    except Exception as e:
-        st.error(f"❌ Error loading stations from database: {e}")
-        st.stop()
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def load_sessions_data():
-    """Load recent charging sessions from MySQL, fallback to older data"""
-    if not MYSQL_AVAILABLE or engine is None:
-        st.error("❌ Database connection required. Please configure MySQL credentials.")
-        st.stop()
-
-    try:
-        df = get_recent_sessions(hours=168)  # Last 7 days
-        if df.empty:
-            # Fallback: Try to get ANY session data
-            df = load_from_mysql('charging_sessions', limit=1000)
-            if df.empty:
-                st.warning("⚠️ No sessions data found in database.")
-                st.stop()
-            else:
-                st.info("📡 Displaying older session data (last 7 days not available)")
-        return df
-    except Exception as e:
-        st.error(f"❌ Error loading sessions data: {e}")
-        st.stop()
-
-# Helper function to format CEST time
-def format_cest_time(dt):
-    """Format datetime to CEST timezone"""
+def format_oslo_time(dt):
+    """Convert UTC datetime to Oslo timezone"""
     if dt.tzinfo is None:
         dt = pytz.utc.localize(dt)
-    return dt.astimezone(CEST)
+    return dt.astimezone(OSLO_TZ)
 
+# Optimized data loading functions
+@st.cache_data(ttl=60)  # Cache for 1 minute
+def load_stations_data():
+    """Load charging stations data"""
+    query = """
+    SELECT 
+        id, name, operator, status, address, description,
+        latitude, longitude, total_connectors, 
+        ccs_connectors, chademo_connectors, type2_connectors, other_connectors,
+        amenities, last_updated
+    FROM charging_stations
+    WHERE latitude IS NOT NULL AND longitude IS NOT NULL
+    """
+    
+    try:
+        df = pd.read_sql(query, engine)
+        if df.empty:
+            st.warning("⚠️ No charging stations found in database")
+            return pd.DataFrame()
+        
+        # Convert numeric columns
+        numeric_cols = ['latitude', 'longitude', 'total_connectors', 
+                       'ccs_connectors', 'chademo_connectors', 'type2_connectors', 'other_connectors']
+        for col in numeric_cols:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        
+        return df
+    except Exception as e:
+        st.error(f"Error loading stations: {e}")
+        return pd.DataFrame()
 
-# Better auto-refresh functionality with navigation preservation
-def check_auto_refresh():
-    """Check if it's time to auto-refresh (every 60 seconds) without disrupting navigation"""
-    current_time = time.time()
+@st.cache_data(ttl=60)
+def load_utilization_data():
+    """Load latest 24 hours utilization data"""
+    query = """
+    SELECT 
+        timestamp, hourly_timestamp, station_id, connector_id, connector_type,
+        power, status, is_occupied, is_available, is_out_of_order, tariff
+    FROM utilization_data
+    WHERE timestamp >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
+    ORDER BY timestamp DESC
+    """
+    
+    try:
+        df = pd.read_sql(query, engine)
+        if not df.empty:
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            df['hourly_timestamp'] = pd.to_datetime(df['hourly_timestamp'])
+        return df
+    except Exception as e:
+        st.error(f"Error loading utilization data: {e}")
+        return pd.DataFrame()
 
-    if (st.session_state.auto_refresh_enabled and
-            current_time - st.session_state.last_refresh > REFRESH_INTERVAL):
-        st.session_state.last_refresh = current_time
-        # Only clear data cache, not navigation state
-        load_stations_data.clear()
-        load_utilization_data.clear()
-        load_historical_utilization_data.clear()
-        # Don't clear hourly and sessions cache as frequently
-        if current_time % 300 < 60:  # Clear every 5 minutes
-            load_hourly_data.clear()
-            load_sessions_data.clear()
+@st.cache_data(ttl=60)
+def load_hourly_data():
+    """Load hourly aggregated data for last 24 hours"""
+    query = """
+    SELECT 
+        hourly_timestamp, station_id, is_available, is_occupied, 
+        is_out_of_order, total_connectors, occupancy_rate, availability_rate
+    FROM hourly_utilization
+    WHERE hourly_timestamp >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
+    ORDER BY hourly_timestamp DESC
+    """
+    
+    try:
+        df = pd.read_sql(query, engine)
+        if not df.empty:
+            df['hourly_timestamp'] = pd.to_datetime(df['hourly_timestamp'])
+        return df
+    except Exception as e:
+        st.error(f"Error loading hourly data: {e}")
+        return pd.DataFrame()
+
+@st.cache_data(ttl=60)
+def load_sessions_data():
+    """Load charging sessions for last 24 hours"""
+    query = """
+    SELECT 
+        s.connector_id, s.station_id, s.start_time, s.end_time,
+        s.duration_hours, s.energy_kwh, s.revenue_nok,
+        st.name as station_name, st.address as station_address
+    FROM charging_sessions s
+    LEFT JOIN charging_stations st ON s.station_id = st.id
+    WHERE s.end_time >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
+    ORDER BY s.end_time DESC
+    """
+    
+    try:
+        df = pd.read_sql(query, engine)
+        if not df.empty:
+            df['start_time'] = pd.to_datetime(df['start_time'])
+            df['end_time'] = pd.to_datetime(df['end_time'])
+        return df
+    except Exception as e:
+        st.error(f"Error loading sessions data: {e}")
+        return pd.DataFrame()
+
+def get_latest_connector_status():
+    """Get latest status for each connector"""
+    query = """
+    SELECT u1.*
+    FROM utilization_data u1
+    INNER JOIN (
+        SELECT connector_id, MAX(timestamp) as max_timestamp
+        FROM utilization_data
+        WHERE timestamp >= DATE_SUB(NOW(), INTERVAL 2 HOUR)
+        GROUP BY connector_id
+    ) u2 ON u1.connector_id = u2.connector_id AND u1.timestamp = u2.max_timestamp
+    """
+    
+    try:
+        df = pd.read_sql(query, engine)
+        if not df.empty:
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+        return df
+    except Exception as e:
+        st.error(f"Error loading latest connector status: {e}")
+        return pd.DataFrame()
+
+# Auto-refresh functionality
+def setup_auto_refresh():
+    """Setup auto-refresh mechanism"""
+    if 'last_refresh' not in st.session_state:
+        st.session_state.last_refresh = time.time()
+    
+    # Auto-refresh every 60 seconds
+    if time.time() - st.session_state.last_refresh > 60:
+        st.session_state.last_refresh = time.time()
+        st.cache_data.clear()
         st.rerun()
 
-
-def show_refresh_timer():
-    """Show countdown to next refresh"""
-    if st.session_state.auto_refresh_enabled:
-        time_since_refresh = int(time.time() - st.session_state.last_refresh)
-        time_to_refresh = REFRESH_INTERVAL - time_since_refresh
-
-        if time_to_refresh > 0:
-            st.markdown(
-                f'<div class="refresh-timer">🔄 Auto-refresh in {time_to_refresh}s</div>',
-                unsafe_allow_html=True
-            )
-        else:
-            st.markdown(
-                '<div class="refresh-timer">🔄 Refreshing...</div>',
-                unsafe_allow_html=True
-            )
-
-
-# Revenue calculation utilities
-def extract_tariff(tariff_str):
-    """Extract numeric tariff from string"""
-    if pd.isna(tariff_str) or tariff_str == '':
-        return 0.0
-    tariff_str = re.sub(r'[^\d.,]', '', str(tariff_str)).replace(',', '.')
-    match = re.search(r'\d+\.?\d*', tariff_str)
-    return float(match.group()) if match else 0.0
-
-
-# Error handling for deployment - database required
-def handle_deployment_errors():
-    """Handle database connection requirements"""
-    if not MYSQL_AVAILABLE or engine is None:
-        st.error("❌ **Database Connection Required**")
-        st.markdown("""
-        This dashboard requires a MySQL database connection. Please:
-
-        1. **Set up MySQL database** (Railway, PlanetScale, AWS RDS, etc.)
-        2. **Configure credentials** in Streamlit secrets or environment variables:
-           - `MYSQL_HOST`
-           - `MYSQL_USER` 
-           - `MYSQL_PASSWORD`
-           - `MYSQL_DATABASE`
-           - OR single `DATABASE_URL`
-        3. **Ensure database tables exist** with the correct schema
-        4. **Run ETL pipeline** to populate data
-
-        See deployment guide for detailed instructions.
-        """)
-        st.stop()
-
-    try:
-        # Test database connectivity
-        connection_status, message = test_mysql_connection()
-        if not connection_status:
-            st.error(f"❌ **Database Connection Failed**: {message}")
-            st.stop()
-    except Exception as e:
-        st.error(f"❌ **Database Error**: {e}")
-        st.stop()
-
-
-# Main dashboard with better navigation handling
-def main():
-    # Check for auto-refresh but preserve navigation state
-    check_auto_refresh()
-
-    # Title with updated refresh info
-    st.markdown("""
-    <div style="text-align: center; color: #666; padding: 20px;">
-        <h1 style="color: #1f77b4; margin-bottom: 1rem;">⚡ EV Charging Analytics Dashboard</h1>
-        <p>📊 MySQL Backend | Real-time Updates every 60 seconds</p>
-        <p>Data updates automatically | Last refresh: {} CEST</p>
-    </div>
-    """.format(get_cest_time().strftime('%Y-%m-%d %H:%M:%S')), unsafe_allow_html=True)
-
-    # Show refresh timer
-    show_refresh_timer()
-
-    # Load data with better error handling and spinner control
-    if not st.session_state.data_loaded:
-        with st.spinner('Loading initial data...'):
-            try:
-                stations_df = load_stations_data()
-                utilization_df = load_utilization_data()
-                st.session_state.data_loaded = True
-            except Exception as e:
-                st.error(f"Error loading initial data: {e}")
-                st.stop()
+def show_refresh_status():
+    """Show refresh status indicator"""
+    time_since_refresh = int(time.time() - st.session_state.get('last_refresh', time.time()))
+    next_refresh = 60 - time_since_refresh
+    
+    if next_refresh > 0:
+        st.markdown(
+            f'<div class="refresh-info">🔄 Next refresh in {next_refresh}s</div>',
+            unsafe_allow_html=True
+        )
     else:
-        # Load data silently after initial load
-        try:
-            stations_df = load_stations_data()
-            utilization_df = load_utilization_data()
-        except Exception as e:
-            st.error(f"Error refreshing data: {e}")
-            st.stop()
-
-    # Sidebar with better navigation state management
-    with st.sidebar:
-        st.image("https://via.placeholder.com/300x100/1f77b4/ffffff?text=EV+Charging+Analytics", width=300)
-        st.markdown("### 🔌 Navigation")
-
-        # Use session state for navigation to prevent page switching issues
-        page_options = ["📊 Overview", "🗺️ Station Map", "📈 Utilization Analytics",
-                        "⚡ Real-time Monitor", "📋 Data Explorer"]
-
-        page = st.radio(
-            "Select Dashboard",
-            options=page_options,
-            index=page_options.index(
-                st.session_state.current_page) if st.session_state.current_page in page_options else 0,
-            key="navigation_radio"
+        st.markdown(
+            '<div class="refresh-info">🔄 Refreshing...</div>',
+            unsafe_allow_html=True
         )
 
-        # Update session state when page changes
-        if page != st.session_state.current_page:
-            st.session_state.current_page = page
-
+# Main application
+def main():
+    setup_auto_refresh()
+    
+    # Header
+    st.markdown('<h1 class="main-header">⚡ EV Charging Analytics Dashboard</h1>', unsafe_allow_html=True)
+    show_refresh_status()
+    
+    # Load all data
+    with st.spinner('Loading data...'):
+        stations_df = load_stations_data()
+        utilization_df = load_utilization_data()
+        hourly_df = load_hourly_data()
+        sessions_df = load_sessions_data()
+        latest_status_df = get_latest_connector_status()
+    
+    # Sidebar navigation
+    with st.sidebar:
+        st.markdown("### 🧭 Navigation")
+        page = st.selectbox(
+            "Select Dashboard",
+            ["📊 Overview", "🗺️ Station Map", "📈 Utilization Analysis", 
+             "⚡ Real-time Monitor", "📋 Data Explorer"]
+        )
+        
         st.markdown("---")
-        st.markdown("### 🕐 Last Updated (CEST)")
-        st.info(f"{get_cest_time().strftime('%Y-%m-%d %H:%M:%S')}")
-
-        # Auto-refresh controls
+        st.markdown("### ⏱️ Data Status")
+        st.info(f"Last updated: {get_oslo_time().strftime('%H:%M:%S')}")
+        
+        # Quick stats
+        st.markdown("### 📊 Quick Stats")
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.metric("Stations", len(stations_df))
+            occupied = len(latest_status_df[latest_status_df['is_occupied'] == 1]) if not latest_status_df.empty else 0
+            st.metric("Active", occupied)
+        
+        with col2:
+            total_connectors = stations_df['total_connectors'].sum() if not stations_df.empty else 0
+            st.metric("Connectors", total_connectors)
+            
+            if not sessions_df.empty:
+                daily_revenue = sessions_df['revenue_nok'].sum()
+                st.metric("Revenue", f"NOK {daily_revenue:,.0f}")
+        
         st.markdown("---")
-        st.markdown("### ⚙️ Settings")
-
-        auto_refresh = st.checkbox("Real-time refresh (60s)", value=st.session_state.auto_refresh_enabled)
-        st.session_state.auto_refresh_enabled = auto_refresh
-
-        if st.button("🔄 Refresh Now"):
-            # Clear all caches and reset timer
+        if st.button("🔄 Refresh Data"):
             st.cache_data.clear()
             st.session_state.last_refresh = time.time()
-            st.session_state.data_loaded = False
             st.rerun()
-
-        st.markdown("---")
-        st.markdown("### 📊 Quick Stats")
-        st.metric("Total Stations", len(stations_df))
-
-        active_sessions = len(utilization_df[utilization_df['is_occupied'] == 1]) if not utilization_df.empty else 0
-        st.metric("Active Sessions", active_sessions)
-
-        total_connectors = stations_df['total_connectors'].sum() if not stations_df.empty else 0
-        st.metric("Total Connectors", total_connectors)
-
-        # Database connection status
-        st.markdown("---")
-        st.markdown("### 🗄️ Database Status")
-        if MYSQL_AVAILABLE and engine is not None:
-            connection_status, message = test_mysql_connection()
-            if connection_status:
-                st.success("✅ MySQL Connected")
-            else:
-                st.error(f"❌ MySQL Error: {message}")
-        else:
-            st.error("❌ No Database Connection")
-
-        # Data freshness indicator
-        if not utilization_df.empty and 'timestamp' in utilization_df.columns:
-            latest_data = utilization_df['timestamp'].max()
-            if latest_data.tzinfo is None:
-                latest_data = pytz.utc.localize(latest_data)
-            latest_data_cest = latest_data.astimezone(CEST)
-            data_age = (get_cest_time() - latest_data_cest).total_seconds() / 60
-
-            if data_age < 5:
-                st.success(f"📡 Data current")
-            elif data_age < 30:
-                st.warning(f"📡 Data {data_age:.1f}m old")
-            else:
-                st.error(f"📡 Data {data_age:.1f}m old")
-
-    # Page routing with better state management
-    # Load additional data based on page requirements
-    hourly_df = pd.DataFrame()
-    sessions_df = pd.DataFrame()
-    historical_util_df = pd.DataFrame()
-
-    # Load sessions data for pages that need revenue information
-    if st.session_state.current_page in ["📊 Overview", "🗺️ Station Map", "📈 Utilization Analytics",
-                                         "⚡ Real-time Monitor", "📋 Data Explorer"]:
-        sessions_df = load_sessions_data()
-
-    # Load hourly data for analytics pages
-    if st.session_state.current_page in ["📊 Overview", "📈 Utilization Analytics", "📋 Data Explorer"]:
-        hourly_df = load_hourly_data()
-
-    # Load historical utilization data for analytics
-    if st.session_state.current_page == "📈 Utilization Analytics":
-        historical_util_df = load_historical_utilization_data(24)
-
-    # Route to appropriate page
-    if st.session_state.current_page == "📊 Overview":
-        show_overview(stations_df, utilization_df, hourly_df, sessions_df)
-    elif st.session_state.current_page == "🗺️ Station Map":
-        show_station_map(stations_df, utilization_df, sessions_df)
-    elif st.session_state.current_page == "📈 Utilization Analytics":
-        show_utilization_analytics(utilization_df, hourly_df, sessions_df, historical_util_df)
-    elif st.session_state.current_page == "⚡ Real-time Monitor":
-        show_realtime_monitor(stations_df, utilization_df, sessions_df)
-    elif st.session_state.current_page == "📋 Data Explorer":
+    
+    # Route to appropriate dashboard
+    if page == "📊 Overview":
+        show_overview_dashboard(stations_df, utilization_df, hourly_df, sessions_df, latest_status_df)
+    elif page == "🗺️ Station Map":
+        show_map_dashboard(stations_df, latest_status_df, sessions_df)
+    elif page == "📈 Utilization Analysis":
+        show_utilization_dashboard(utilization_df, hourly_df, sessions_df)
+    elif page == "⚡ Real-time Monitor":
+        show_realtime_dashboard(stations_df, latest_status_df, sessions_df)
+    else:  # Data Explorer
         show_data_explorer(stations_df, utilization_df, hourly_df, sessions_df)
 
-
-def show_overview(stations_df, utilization_df, hourly_df, sessions_df):
-    """Show comprehensive overview dashboard"""
-    st.header("📊 Overview Dashboard")
-
-    # Key metrics row
+def show_overview_dashboard(stations_df, utilization_df, hourly_df, sessions_df, latest_status_df):
+    """Overview dashboard with key metrics and insights"""
+    
+    # Key Performance Indicators
+    st.markdown('<div class="kpi-container">', unsafe_allow_html=True)
     col1, col2, col3, col4 = st.columns(4)
-
+    
+    # Calculate metrics
+    total_stations = len(stations_df)
+    available_stations = len(stations_df[stations_df['status'] == 'Available']) if not stations_df.empty else 0
+    
+    total_connectors = stations_df['total_connectors'].sum() if not stations_df.empty else 0
+    occupied_connectors = len(latest_status_df[latest_status_df['is_occupied'] == 1]) if not latest_status_df.empty else 0
+    
+    avg_occupancy = (occupied_connectors / total_connectors * 100) if total_connectors > 0 else 0
+    
+    daily_revenue = sessions_df['revenue_nok'].sum() if not sessions_df.empty else 0
+    
     with col1:
-        total_stations = len(stations_df)
-        available_stations = len(stations_df[stations_df['status'] == 'Available'])
         st.metric(
-            "Available Stations",
+            "Available Stations", 
             f"{available_stations}/{total_stations}",
-            f"{(available_stations / total_stations * 100):.1f}%" if total_stations > 0 else "0%"
+            f"{(available_stations/total_stations*100):.1f}%" if total_stations > 0 else "0%"
         )
-
+    
     with col2:
-        total_connectors = stations_df['total_connectors'].sum()
-        occupied_connectors = len(utilization_df[utilization_df['is_occupied'] == 1]) if not utilization_df.empty else 0
         st.metric(
-            "Active Sessions",
+            "Active Sessions", 
             occupied_connectors,
-            f"{(occupied_connectors / total_connectors * 100):.1f}% utilization" if total_connectors > 0 else "0%"
+            f"{avg_occupancy:.1f}% utilization"
         )
-
+    
     with col3:
-        if not hourly_df.empty and 'avg_occupancy_rate' in hourly_df.columns:
-            avg_occupancy = hourly_df['avg_occupancy_rate'].mean() * 100
-        else:
-            avg_occupancy = (occupied_connectors / total_connectors * 100) if total_connectors > 0 else 0
-
-        st.metric(
-            "Avg Occupancy Rate",
-            f"{avg_occupancy:.1f}%"
-        )
-
+        st.metric("Avg Occupancy Rate", f"{avg_occupancy:.1f}%")
+    
     with col4:
-        if not sessions_df.empty and 'revenue_nok' in sessions_df.columns:
-            # Calculate daily revenue (last 24 hours)
-            last_24h = datetime.now() - timedelta(hours=24)
-            recent_sessions = sessions_df[sessions_df['end_time'] >= last_24h]
-            daily_revenue_nok = recent_sessions['revenue_nok'].sum()
-            daily_revenue_usd = daily_revenue_nok / 10.5  # Convert to USD
-        else:
-            daily_revenue_usd = 0
-            daily_revenue_nok = 0
-
         st.metric(
-            "Daily Revenue (24h)",
-            f"${daily_revenue_usd:,.0f}",
-            help=f"NOK {daily_revenue_nok:,.0f}"
+            "Daily Revenue (24h)", 
+            f"NOK {daily_revenue:,.0f}",
+            f"${daily_revenue/10.5:,.0f} USD"
         )
-
-    st.markdown("---")
-
-    # Charts row 1
+    
+    st.markdown('</div>', unsafe_allow_html=True)
+    
+    # Charts row
     col1, col2 = st.columns(2)
-
+    
     with col1:
-        # Station status pie chart
+        # Station status distribution
         if not stations_df.empty:
             status_counts = stations_df['status'].value_counts()
+            colors = {'Available': '#2ecc71', 'Occupied': '#f39c12', 'OutOfOrder': '#e74c3c', 'Maintenance': '#9b59b6'}
+            
             fig_pie = px.pie(
                 values=status_counts.values,
                 names=status_counts.index,
                 title="Station Status Distribution",
-                color_discrete_map={
-                    'Available': '#2ecc71',
-                    'Occupied': '#f39c12',
-                    'OutOfOrder': '#e74c3c'
-                }
+                color=status_counts.index,
+                color_discrete_map=colors
             )
             fig_pie.update_traces(textposition='inside', textinfo='percent+label')
+            fig_pie.update_layout(height=400)
             st.plotly_chart(fig_pie, use_container_width=True)
-
+    
     with col2:
         # Connector type distribution
         if not stations_df.empty:
             connector_data = {
                 'CCS': stations_df['ccs_connectors'].sum(),
                 'CHAdeMO': stations_df['chademo_connectors'].sum(),
-                'Type 2': stations_df['type2_connectors'].sum()
+                'Type 2': stations_df['type2_connectors'].sum(),
+                'Other': stations_df['other_connectors'].sum()
             }
+            
+            # Filter out zero values
+            connector_data = {k: v for k, v in connector_data.items() if v > 0}
+            
             fig_bar = px.bar(
                 x=list(connector_data.keys()),
                 y=list(connector_data.values()),
@@ -742,956 +464,917 @@ def show_overview(stations_df, utilization_df, hourly_df, sessions_df):
                 labels={'x': 'Connector Type', 'y': 'Count'},
                 color=list(connector_data.keys()),
                 color_discrete_map={
-                    'CCS': '#3498db',
-                    'CHAdeMO': '#9b59b6',
-                    'Type 2': '#1abc9c'
+                    'CCS': '#3498db', 'CHAdeMO': '#9b59b6', 
+                    'Type 2': '#1abc9c', 'Other': '#e67e22'
                 }
             )
+            fig_bar.update_layout(height=400, showlegend=False)
             st.plotly_chart(fig_bar, use_container_width=True)
+    
+    # 24-Hour usage pattern
+    st.subheader("📈 24-Hour Usage Pattern")
+    
+    if not sessions_df.empty:
+        # Create hourly usage pattern
+        sessions_df['hour'] = sessions_df['start_time'].dt.hour
+        hourly_sessions = sessions_df.groupby('hour').agg({
+            'connector_id': 'count',
+            'revenue_nok': 'sum',
+            'energy_kwh': 'sum'
+        }).reset_index()
+        hourly_sessions.columns = ['hour', 'sessions', 'revenue', 'energy']
+        
+        # Ensure all 24 hours are represented
+        all_hours = pd.DataFrame({'hour': range(24)})
+        hourly_sessions = all_hours.merge(hourly_sessions, on='hour', how='left').fillna(0)
+        
+        fig_usage = make_subplots(specs=[[{"secondary_y": True}]])
+        
+        # Sessions bar chart
+        fig_usage.add_trace(
+            go.Bar(
+                x=hourly_sessions['hour'],
+                y=hourly_sessions['sessions'],
+                name='Sessions Started',
+                marker_color='rgba(52, 152, 219, 0.7)',
+                yaxis='y'
+            ),
+            secondary_y=False
+        )
+        
+        # Revenue line chart
+        fig_usage.add_trace(
+            go.Scatter(
+                x=hourly_sessions['hour'],
+                y=hourly_sessions['revenue'],
+                name='Revenue (NOK)',
+                mode='lines+markers',
+                line=dict(color='#e74c3c', width=3),
+                marker=dict(size=8),
+                yaxis='y2'
+            ),
+            secondary_y=True
+        )
+        
+        fig_usage.update_xaxes(
+            title_text="Hour of Day",
+            tickmode='linear',
+            tick0=0,
+            dtick=2
+        )
+        fig_usage.update_yaxes(title_text="Sessions Started", secondary_y=False)
+        fig_usage.update_yaxes(title_text="Revenue (NOK)", secondary_y=True)
+        fig_usage.update_layout(
+            title='24-Hour Usage Pattern',
+            hovermode='x unified',
+            height=400,
+            legend=dict(orientation='h', y=-0.2)
+        )
+        
+        st.plotly_chart(fig_usage, use_container_width=True)
+    else:
+        st.info("No session data available for usage pattern")
+    
+    # Top performing stations
+    st.subheader("🏆 Top Performing Stations (Last 24h)")
+    
+    if not sessions_df.empty:
+        station_performance = sessions_df.groupby(['station_id', 'station_name']).agg({
+            'revenue_nok': 'sum',
+            'energy_kwh': 'sum',
+            'connector_id': 'count'
+        }).reset_index()
+        station_performance.columns = ['station_id', 'station_name', 'revenue', 'energy', 'sessions']
+        station_performance = station_performance.sort_values('revenue', ascending=False).head(10)
+        
+        if not station_performance.empty:
+            # Format the data for display
+            display_df = station_performance[['station_name', 'revenue', 'energy', 'sessions']].copy()
+            display_df['revenue'] = display_df['revenue'].round(0)
+            display_df['energy'] = display_df['energy'].round(1)
+            display_df.columns = ['Station Name', 'Revenue (NOK)', 'Energy (kWh)', 'Sessions']
+            
+            st.dataframe(display_df, hide_index=True, use_container_width=True)
+        else:
+            st.info("No station performance data available")
+    else:
+        st.info("No session data available for station ranking")
 
-    # Hourly utilization pattern
-    st.markdown("---")
+def show_map_dashboard(stations_df, latest_status_df, sessions_df):
+    """Interactive map dashboard"""
+    st.header("🗺️ Charging Station Map")
+    
+    if stations_df.empty:
+        st.warning("No station data available")
+        return
+    
+    # Filters
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        status_filter = st.multiselect(
+            "Filter by Status",
+            options=stations_df['status'].unique().tolist(),
+            default=stations_df['status'].unique().tolist()
+        )
+    
+    with col2:
+        min_connectors = st.slider(
+            "Minimum Connectors",
+            min_value=1,
+            max_value=int(stations_df['total_connectors'].max()),
+            value=1
+        )
+    
+    with col3:
+        map_style = st.selectbox(
+            "Map Style",
+            ['OpenStreetMap', 'CartoDB positron', 'CartoDB dark_matter']
+        )
+    
+    # Filter data
+    filtered_stations = stations_df[
+        (stations_df['status'].isin(status_filter)) &
+        (stations_df['total_connectors'] >= min_connectors)
+    ]
+    
+    if filtered_stations.empty:
+        st.warning("No stations match the selected filters")
+        return
+    
+    # Calculate center
+    center_lat = filtered_stations['latitude'].mean()
+    center_lon = filtered_stations['longitude'].mean()
+    
+    # Create map
+    m = folium.Map(
+        location=[center_lat, center_lon],
+        zoom_start=8,
+        tiles=map_style.replace(' ', '')
+    )
+    
+    # Calculate station revenues
+    station_revenues = {}
+    if not sessions_df.empty:
+        station_revenues = sessions_df.groupby('station_id')['revenue_nok'].sum().to_dict()
+    
+    # Add markers
+    for _, station in filtered_stations.iterrows():
+        # Get current status
+        station_connectors = latest_status_df[latest_status_df['station_id'] == station['id']] if not latest_status_df.empty else pd.DataFrame()
+        
+        if not station_connectors.empty:
+            occupied = len(station_connectors[station_connectors['is_occupied'] == 1])
+            available = len(station_connectors[station_connectors['is_available'] == 1])
+            out_of_order = len(station_connectors[station_connectors['is_out_of_order'] == 1])
+        else:
+            occupied = 0
+            available = station['total_connectors']
+            out_of_order = 0
+        
+        # Determine marker color
+        if out_of_order == station['total_connectors']:
+            color = 'red'
+            status_text = 'Out of Order'
+        elif available > 0:
+            color = 'green'
+            status_text = 'Available'
+        elif occupied > 0:
+            color = 'orange'
+            status_text = 'Fully Occupied'
+        else:
+            color = 'gray'
+            status_text = 'Unknown'
+        
+        revenue = station_revenues.get(station['id'], 0)
+        
+        popup_html = f"""
+        <div style="font-family: Arial; width: 250px;">
+            <h4 style="margin: 0 0 10px 0; color: #1f77b4;">{station['name']}</h4>
+            <p><b>Status:</b> <span style="color: {color};">●</span> {status_text}</p>
+            <p><b>Address:</b> {station.get('address', 'N/A')}</p>
+            <p><b>Connectors:</b> {station['total_connectors']} total</p>
+            <div style="margin: 10px 0;">
+                <div>🟢 Available: {available}</div>
+                <div>🟠 Occupied: {occupied}</div>
+                <div>🔴 Out of Order: {out_of_order}</div>
+            </div>
+            <p><b>Types:</b></p>
+            <div style="font-size: 0.9em;">
+                • CCS: {station.get('ccs_connectors', 0)}<br>
+                • CHAdeMO: {station.get('chademo_connectors', 0)}<br>
+                • Type 2: {station.get('type2_connectors', 0)}
+            </div>
+            <p><b>Revenue (24h):</b> NOK {revenue:,.0f}</p>
+        </div>
+        """
+        
+        folium.Marker(
+            location=[station['latitude'], station['longitude']],
+            popup=folium.Popup(popup_html, max_width=300),
+            icon=folium.Icon(color=color, icon='plug', prefix='fa'),
+            tooltip=f"{station['name']} - {status_text}"
+        ).add_to(m)
+    
+    # Display map
+    st_folium(m, width=None, height=600)
+    
+    # Map statistics
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        st.metric("Stations Shown", len(filtered_stations))
+    
+    with col2:
+        total_connectors = filtered_stations['total_connectors'].sum()
+        st.metric("Total Connectors", total_connectors)
+    
+    with col3:
+        total_revenue = sum(station_revenues.get(sid, 0) for sid in filtered_stations['id'])
+        st.metric("Total Revenue (24h)", f"NOK {total_revenue:,.0f}")
+    
+    with col4:
+        avg_connectors = filtered_stations['total_connectors'].mean()
+        st.metric("Avg Connectors/Station", f"{avg_connectors:.1f}")
 
-    if not sessions_df.empty or not utilization_df.empty:
-        # Create comprehensive hourly pattern chart
-        fig_line = make_subplots(specs=[[{"secondary_y": True}]])
-
-        # Add session counts if available
-        if not sessions_df.empty and 'start_time' in sessions_df.columns:
-            sessions_df_copy = sessions_df.copy()
-            sessions_df_copy['hour'] = sessions_df_copy['start_time'].dt.hour
-            sessions_per_hour = sessions_df_copy.groupby('hour').size()
-
-            # Ensure all hours are represented
-            all_hours = pd.Series(0, index=range(24))
-            all_hours.update(sessions_per_hour)
-            sessions_per_hour = all_hours
-
-            fig_line.add_trace(
+def show_utilization_dashboard(utilization_df, hourly_df, sessions_df):
+    """Comprehensive utilization analysis dashboard"""
+    st.header("📈 Utilization Analysis")
+    
+    # Create tabs for different analyses
+    tab1, tab2, tab3, tab4 = st.tabs(["🔥 24h Heatmap", "📊 Trends", "⚡ Power & Revenue", "📋 Session Analysis"])
+    
+    with tab1:
+        st.subheader("24-Hour Utilization Heatmap")
+        
+        if not utilization_df.empty:
+            # Prepare heatmap data
+            heatmap_data = utilization_df.copy()
+            heatmap_data['hour'] = heatmap_data['timestamp'].dt.hour
+            heatmap_data['day_name'] = heatmap_data['timestamp'].dt.day_name()
+            
+            # Create pivot table
+            pivot_data = heatmap_data.groupby(['day_name', 'hour'])['is_occupied'].mean().reset_index()
+            pivot_table = pivot_data.pivot(index='day_name', columns='hour', values='is_occupied')
+            
+            # Ensure all hours are present
+            for hour in range(24):
+                if hour not in pivot_table.columns:
+                    pivot_table[hour] = 0
+            
+            # Order days correctly
+            day_order = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+            pivot_table = pivot_table.reindex([d for d in day_order if d in pivot_table.index])
+            pivot_table = pivot_table.fillna(0)
+            
+            # Create heatmap
+            fig_heatmap = go.Figure(data=go.Heatmap(
+                z=pivot_table.values,
+                x=list(range(24)),
+                y=pivot_table.index.tolist(),
+                colorscale='RdYlGn_r',
+                colorbar=dict(title='Occupancy Rate'),
+                hoverongaps=False,
+                hovertemplate='Day: %{y}<br>Hour: %{x}<br>Occupancy: %{z:.1%}<extra></extra>'
+            ))
+            
+            fig_heatmap.update_layout(
+                title='Weekly Utilization Pattern',
+                xaxis_title='Hour of Day',
+                yaxis_title='Day of Week',
+                height=400,
+                xaxis=dict(tickmode='linear', tick0=0, dtick=2)
+            )
+            
+            st.plotly_chart(fig_heatmap, use_container_width=True)
+            
+            # Peak usage insights
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                if not sessions_df.empty:
+                    peak_hour_sessions = sessions_df.groupby(sessions_df['start_time'].dt.hour).size()
+                    peak_hour = peak_hour_sessions.idxmax()
+                    peak_count = peak_hour_sessions.max()
+                    st.metric("Peak Usage Hour", f"{peak_hour}:00", f"{peak_count} sessions")
+                else:
+                    st.metric("Peak Usage Hour", "No data", "0 sessions")
+            
+            with col2:
+                avg_occupancy = heatmap_data['is_occupied'].mean()
+                st.metric("Average Occupancy", f"{avg_occupancy:.1%}")
+        
+        else:
+            st.info("No utilization data available for heatmap")
+    
+    with tab2:
+        st.subheader("Utilization Trends")
+        
+        if not hourly_df.empty:
+            # Trend analysis
+            trend_data = hourly_df.groupby('hourly_timestamp').agg({
+                'is_occupied': 'sum',
+                'is_available': 'sum',
+                'is_out_of_order': 'sum',
+                'occupancy_rate': 'mean'
+            }).reset_index()
+            
+            fig_trend = make_subplots(
+                rows=2, cols=1,
+                subplot_titles=('Connector Status Over Time', 'Average Occupancy Rate'),
+                vertical_spacing=0.1
+            )
+            
+            # Status trend
+            fig_trend.add_trace(
+                go.Scatter(
+                    x=trend_data['hourly_timestamp'], 
+                    y=trend_data['is_occupied'],
+                    name='Occupied', 
+                    line=dict(color='#e74c3c', width=2),
+                    fill='tonexty' if 'is_available' in trend_data.columns else None
+                ),
+                row=1, col=1
+            )
+            
+            fig_trend.add_trace(
+                go.Scatter(
+                    x=trend_data['hourly_timestamp'], 
+                    y=trend_data['is_available'],
+                    name='Available', 
+                    line=dict(color='#2ecc71', width=2),
+                    fill='tozeroy'
+                ),
+                row=1, col=1
+            )
+            
+            # Occupancy rate trend
+            fig_trend.add_trace(
+                go.Scatter(
+                    x=trend_data['hourly_timestamp'], 
+                    y=trend_data['occupancy_rate'] * 100,
+                    name='Occupancy %', 
+                    line=dict(color='#3498db', width=3),
+                    mode='lines+markers'
+                ),
+                row=2, col=1
+            )
+            
+            fig_trend.update_yaxes(title_text="Connector Count", row=1, col=1)
+            fig_trend.update_yaxes(title_text="Occupancy %", row=2, col=1)
+            fig_trend.update_layout(height=600, showlegend=True)
+            
+            st.plotly_chart(fig_trend, use_container_width=True)
+            
+            # Trend insights
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                current_occupancy = trend_data['occupancy_rate'].iloc[-1] * 100 if not trend_data.empty else 0
+                st.metric("Current Occupancy", f"{current_occupancy:.1f}%")
+            
+            with col2:
+                peak_occupancy = trend_data['occupancy_rate'].max() * 100 if not trend_data.empty else 0
+                st.metric("Peak Occupancy (24h)", f"{peak_occupancy:.1f}%")
+            
+            with col3:
+                avg_occupancy = trend_data['occupancy_rate'].mean() * 100 if not trend_data.empty else 0
+                st.metric("Average Occupancy", f"{avg_occupancy:.1f}%")
+        
+        else:
+            st.info("No hourly trend data available")
+    
+    with tab3:
+        st.subheader("Power & Revenue Analysis")
+        
+        if not sessions_df.empty:
+            # Revenue analysis by hour
+            sessions_df['hour'] = sessions_df['start_time'].dt.hour
+            hourly_revenue = sessions_df.groupby('hour').agg({
+                'revenue_nok': ['sum', 'mean'],
+                'energy_kwh': ['sum', 'mean'],
+                'connector_id': 'count'
+            }).round(2)
+            
+            hourly_revenue.columns = ['total_revenue', 'avg_revenue', 'total_energy', 'avg_energy', 'sessions']
+            hourly_revenue = hourly_revenue.reset_index()
+            
+            # Revenue pattern chart
+            fig_revenue = make_subplots(specs=[[{"secondary_y": True}]])
+            
+            fig_revenue.add_trace(
                 go.Bar(
-                    x=sessions_per_hour.index,
-                    y=sessions_per_hour.values,
-                    name='Sessions Started',
-                    marker_color='#3498db',
-                    opacity=0.7
+                    x=hourly_revenue['hour'],
+                    y=hourly_revenue['total_revenue'],
+                    name='Total Revenue (NOK)',
+                    marker_color='rgba(46, 204, 113, 0.7)'
                 ),
                 secondary_y=False
             )
-
-        # Add occupancy data
-        if not utilization_df.empty and 'timestamp' in utilization_df.columns:
-            hourly_occupancy = utilization_df.groupby(utilization_df['timestamp'].dt.hour)[
-                'is_occupied'].sum().reset_index()
-
-            fig_line.add_trace(
+            
+            fig_revenue.add_trace(
                 go.Scatter(
-                    x=hourly_occupancy['timestamp'],
-                    y=hourly_occupancy['is_occupied'],
-                    name='Occupied Connectors',
+                    x=hourly_revenue['hour'],
+                    y=hourly_revenue['sessions'],
+                    name='Sessions',
                     mode='lines+markers',
                     line=dict(color='#e74c3c', width=3),
                     marker=dict(size=8)
                 ),
                 secondary_y=True
             )
-
-        # Update layout
-        fig_line.update_xaxes(title_text="Hour of Day", tickmode='linear', tick0=0, dtick=1)
-        fig_line.update_yaxes(title_text="Sessions Started", secondary_y=False)
-        fig_line.update_yaxes(title_text="Occupied Connectors", secondary_y=True)
-        fig_line.update_layout(
-            title='24-Hour Usage Pattern',
-            hovermode='x unified',
-            legend=dict(orientation='h', y=-0.2)
-        )
-
-        st.plotly_chart(fig_line, use_container_width=True)
-
-    # Station performance table
-    st.markdown("---")
-    st.subheader("🏆 Top Performing Stations")
-
-    if not sessions_df.empty and 'station_id' in sessions_df.columns:
-        # Aggregate revenue by station
-        station_revenue = sessions_df.groupby('station_id').agg({
-            'revenue_nok': 'sum',
-            'energy_kwh': 'sum',
-            'connector_id': 'count'
-        }).reset_index()
-        station_revenue.columns = ['station_id', 'total_revenue', 'total_energy', 'session_count']
-
-        # Merge with station info
-        station_performance = station_revenue.merge(
-            stations_df[['id', 'name', 'address']],
-            left_on='station_id',
-            right_on='id',
-            how='left'
-        )
-
-        # Sort by revenue and get top 10
-        station_performance = station_performance.sort_values('total_revenue', ascending=False).head(10)
-
-        if not station_performance.empty:
-            st.dataframe(
-                station_performance[['name', 'address', 'total_revenue', 'total_energy', 'session_count']].rename(
-                    columns={
-                        'name': 'Station Name',
-                        'address': 'Address',
-                        'total_revenue': 'Revenue (NOK)',
-                        'total_energy': 'Energy (kWh)',
-                        'session_count': 'Sessions'
-                    }),
-                hide_index=True,
-                use_container_width=True
+            
+            fig_revenue.update_xaxes(title_text="Hour of Day", tickmode='linear', tick0=0, dtick=2)
+            fig_revenue.update_yaxes(title_text="Revenue (NOK)", secondary_y=False)
+            fig_revenue.update_yaxes(title_text="Sessions Count", secondary_y=True)
+            fig_revenue.update_layout(
+                title="Hourly Revenue and Session Pattern",
+                height=400,
+                hovermode='x unified'
             )
-    else:
-        st.info("No session data available for station performance ranking")
-
-
-def show_station_map(stations_df, utilization_df, sessions_df):
-    """Show interactive station map with comprehensive data"""
-    st.header("🗺️ Charging Station Map")
-
-    # Calculate station revenue if sessions data available
-    station_revenue = {}
-    if not sessions_df.empty and 'station_id' in sessions_df.columns:
-        station_revenue = sessions_df.groupby('station_id')['revenue_nok'].sum().to_dict()
-
-    # Filter options
-    col1, col2, col3 = st.columns(3)
-
-    with col1:
-        status_filter = st.multiselect(
-            "Filter by Status",
-            options=['Available', 'Occupied', 'OutOfOrder'],
-            default=['Available', 'Occupied', 'OutOfOrder'],
-            key="map_status_filter"
-        )
-
-    with col2:
-        connector_filter = st.slider(
-            "Minimum Connectors",
-            min_value=1,
-            max_value=int(stations_df['total_connectors'].max()) if not stations_df.empty else 10,
-            value=1,
-            key="map_connector_filter"
-        )
-
-    with col3:
-        map_style = st.selectbox(
-            "Map Style",
-            ['OpenStreetMap', 'CartoDB dark_matter'],
-            key="map_style_selector"
-        )
-
-    # Filter data
-    filtered_df = stations_df[
-        (stations_df['status'].isin(status_filter)) &
-        (stations_df['total_connectors'] >= connector_filter)
-        ] if not stations_df.empty else pd.DataFrame()
-
-    # Create map
-    if len(filtered_df) > 0:
-        # Calculate center
-        center_lat = filtered_df['latitude'].mean()
-        center_lon = filtered_df['longitude'].mean()
-
-        # Create folium map
-        m = folium.Map(
-            location=[center_lat, center_lon],
-            zoom_start=6,
-            tiles=map_style.replace(' ', '')
-        )
-
-        # Add markers
-        for _, station in filtered_df.iterrows():
-            # Get connector status from utilization data
-            if not utilization_df.empty:
-                station_connectors = utilization_df[utilization_df['station_id'] == station['id']]
-                occupied_count = len(station_connectors[station_connectors['is_occupied'] == 1])
-                available_count = len(station_connectors[station_connectors['is_available'] == 1])
-                out_of_order_count = len(station_connectors[station_connectors['is_out_of_order'] == 1])
-            else:
-                occupied_count = 0
-                available_count = station['total_connectors']
-                out_of_order_count = 0
-
-            # Determine marker color
-            if out_of_order_count == station['total_connectors']:
-                color = 'red'
-                status_text = 'Out of Order'
-            elif available_count > 0:
-                color = 'green'
-                status_text = 'Available'
-            elif occupied_count > 0:
-                color = 'orange'
-                status_text = 'Fully Occupied'
-            else:
-                color = 'gray'
-                status_text = 'Unknown'
-
-            # Get revenue for this station
-            revenue = station_revenue.get(station['id'], 0)
-
-            popup_html = f"""
-            <div style="font-family: Arial, sans-serif;">
-                <h4>{station['name']}</h4>
-                <p><b>Status:</b> {status_text}</p>
-                <p><b>Address:</b> {station.get('address', 'N/A')}</p>
-                <p><b>Connectors:</b> {station['total_connectors']}</p>
-                <p><b>Connector Status:</b><br>
-                   - Available: {available_count}<br>
-                   - Occupied: {occupied_count}<br>
-                   - Out of Order: {out_of_order_count}</p>
-                <p><b>Types:</b><br>
-                   - CCS: {station.get('ccs_connectors', 0)}<br>
-                   - CHAdeMO: {station.get('chademo_connectors', 0)}<br>
-                   - Type 2: {station.get('type2_connectors', 0)}</p>
-                <p><b>Total Revenue:</b> NOK {revenue:,.0f}</p>
-            </div>
-            """
-
-            folium.Marker(
-                location=[station['latitude'], station['longitude']],
-                popup=folium.Popup(popup_html, max_width=300),
-                icon=folium.Icon(color=color, icon='plug', prefix='fa'),
-                tooltip=f"{station['name']} - {status_text} - NOK {revenue:,.0f}"
-            ).add_to(m)
-
-        # Display map
-        st_folium(m, width=None, height=600, returned_objects=["last_object_clicked"], key="station_map")
-
-        # Statistics below map
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            st.metric("Stations Shown", len(filtered_df))
-        with col2:
-            st.metric("Total Connectors", filtered_df['total_connectors'].sum())
-        with col3:
-            total_revenue = sum(station_revenue.get(sid, 0) for sid in filtered_df['id'])
-            st.metric("Total Revenue", f"NOK {total_revenue:,.0f}")
-        with col4:
-            if not utilization_df.empty:
-                filtered_oo = len(utilization_df[
-                                      (utilization_df['station_id'].isin(filtered_df['id'])) &
-                                      (utilization_df['is_out_of_order'] == 1)
-                                      ])
-            else:
-                filtered_oo = 0
-            st.metric("Out of Order Connectors", filtered_oo)
-    else:
-        st.warning("No stations match the selected filters")
-
-
-def show_utilization_analytics(utilization_df, hourly_df, sessions_df, historical_util_df):
-    """Show comprehensive utilization analytics with fixed heatmap"""
-    st.header("📈 Utilization Analytics")
-
-    # Time range selector
-    time_range = st.select_slider(
-        "Select Time Range",
-        options=["Last 6 Hours", "Last 12 Hours", "Last 24 Hours", "Last 7 Days", "All Data"],
-        value="Last 24 Hours",
-        key="analytics_time_range"
-    )
-
-    # Filter data based on time range
-    now = datetime.now()
-    if time_range == "Last 6 Hours":
-        time_filter = now - timedelta(hours=6)
-    elif time_range == "Last 12 Hours":
-        time_filter = now - timedelta(hours=12)
-    elif time_range == "Last 24 Hours":
-        time_filter = now - timedelta(hours=24)
-    elif time_range == "Last 7 Days":
-        time_filter = now - timedelta(days=7)
-    else:
-        time_filter = utilization_df['timestamp'].min() if not utilization_df.empty else now - timedelta(days=1)
-
-    # Filter datasets
-    filtered_util = utilization_df[
-        utilization_df['timestamp'] >= time_filter] if not utilization_df.empty else utilization_df
-    filtered_hourly = hourly_df[hourly_df['hourly_timestamp'] >= time_filter] if not hourly_df.empty else hourly_df
-    filtered_sessions = sessions_df[sessions_df['end_time'] >= time_filter] if not sessions_df.empty else sessions_df
-
-    # Create tabs for analytics including heatmap
-    tab1, tab2, tab3, tab4 = st.tabs(["📊 Hourly Heatmap", "📈 Trends", "⚡ Power & Revenue", "💰 Session Analysis"])
-
-    with tab1:
-        # Hourly utilization heatmap
-        st.subheader("Last 24 Hours Utilization Heatmap")
-
-        if not historical_util_df.empty:
-            # Prepare data for heatmap
-            heatmap_data = historical_util_df.copy()
-            heatmap_data['hour'] = heatmap_data['timestamp'].dt.hour
-            heatmap_data['day'] = heatmap_data['timestamp'].dt.day_name()
-
-            # Calculate occupancy rate for each day-hour combination
-            pivot_data = heatmap_data.groupby(['day', 'hour'])['is_occupied'].mean().reset_index()
-
-            if not pivot_data.empty:
-                pivot_table = pivot_data.pivot(index='day', columns='hour', values='is_occupied')
-
-                # Ensure all hours 0-23 exist
-                for hour in range(24):
-                    if hour not in pivot_table.columns:
-                        pivot_table[hour] = 0
-
-                pivot_table = pivot_table.reindex(sorted(pivot_table.columns), axis=1)
-
-                # Order days properly
-                day_order = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
-                existing_days = [d for d in day_order if d in pivot_table.index]
-                if existing_days:
-                    pivot_table = pivot_table.reindex(existing_days)
-                pivot_table = pivot_table.fillna(0)
-
-                # Create custom colorscale optimized for low occupancy rates
-                custom_colorscale = [
-                    [0.0, '#27ae60'],  # 0% - Dark green (fully available)
-                    [0.05, '#2ecc71'],  # ~2% - Green
-                    [0.15, '#f1c40f'],  # ~6% - Yellow (low usage)
-                    [0.35, '#f39c12'],  # ~14% - Orange (approaching average)
-                    [0.5, '#e67e22'],  # ~20% - Dark orange (above average)
-                    [0.7, '#e74c3c'],  # ~28% - Red (high usage)
-                    [0.85, '#c0392b'],  # ~34% - Dark red (very high)
-                    [1.0, '#8b0000']  # 40%+ - Very dark red (extremely high)
-                ]
-
-                # Create heatmap with adjusted color scale for better sensitivity
-                fig_heatmap = go.Figure(data=go.Heatmap(
-                    z=pivot_table.values,
-                    x=list(range(24)),
-                    y=pivot_table.index.tolist(),
-                    colorscale=custom_colorscale,
-                    colorbar=dict(
-                        title='Occupancy Rate'
-                    ),
-                    hoverongaps=False,
-                    hovertemplate='Day: %{y}<br>Hour: %{x}:00<br>Occupancy: %{z:.1%}<extra></extra>',
-                    zmin=0,
-                    zmax=0.40  # Cap at 40% to make colors shift more rapidly for typical usage
-                ))
-
-                fig_heatmap.update_layout(
-                    title='Last 24 Hours Utilization Pattern by Hour and Day<br><sub>Colors optimized for typical 15% average occupancy</sub>',
-                    xaxis_title='Hour of Day',
-                    yaxis_title='Day of Week',
-                    height=500,
-                    xaxis=dict(tickmode='linear', tick0=0, dtick=1),
-                    font=dict(size=12)
-                )
-
-                st.plotly_chart(fig_heatmap, use_container_width=True)
-
-                # Add interpretation guide
-                st.info("""
-                **Color Guide for Occupancy Rates:**
-                - 🟢 **Green (0-5%)**: Very low usage, many available connectors
-                - 🟡 **Yellow (5-15%)**: Normal usage, around average occupancy
-                - 🟠 **Orange (15-25%)**: Above average usage, moderate demand
-                - 🔴 **Red (25%+)**: High usage, limited availability
-                """)
-
-                # Show statistics
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    peak_occupancy = pivot_table.values.max()
-                    st.metric("Peak Occupancy", f"{peak_occupancy:.1%}")
-                with col2:
-                    avg_occupancy = pivot_table.values.mean()
-                    st.metric("Average Occupancy", f"{avg_occupancy:.1%}")
-                with col3:
-                    # Find peak hour
-                    hourly_avg = pivot_table.mean(axis=0)
-                    peak_hour = hourly_avg.idxmax()
-                    st.metric("Peak Hour", f"{peak_hour}:00", f"{hourly_avg[peak_hour]:.1%}")
-
-            else:
-                st.warning("No hourly pattern data available")
-        else:
-            st.warning("No historical utilization data available")
-
-    with tab2:
-        # Peak hours analysis
-        col1, col2 = st.columns(2)
-
-        with col1:
-            if not filtered_sessions.empty and 'start_time' in filtered_sessions.columns:
-                peak_hour_sessions = filtered_sessions.groupby(filtered_sessions['start_time'].dt.hour).size()
-                if not peak_hour_sessions.empty:
-                    peak_hour = peak_hour_sessions.idxmax()
-                    peak_count = peak_hour_sessions.max()
-                    st.metric("Peak Hour (Sessions)", f"{peak_hour}:00", f"{peak_count} sessions started")
-                else:
-                    st.metric("Peak Hour (Sessions)", "No data", "0 sessions")
-            else:
-                st.metric("Peak Hour (Sessions)", "No data", "0 sessions")
-
-        with col2:
-            if not filtered_sessions.empty:
-                total_completed = len(filtered_sessions)
-                current_active = len(filtered_util[filtered_util['is_occupied'] == 1]) if not filtered_util.empty else 0
-                st.metric("Sessions", f"{total_completed} completed", f"{current_active} active now")
-            else:
-                current_active = len(filtered_util[filtered_util['is_occupied'] == 1]) if not filtered_util.empty else 0
-                st.metric("Sessions", "0 completed", f"{current_active} active now")
-
-        # Utilization trends
-        st.subheader("Utilization Trends")
-
-        if not filtered_hourly.empty:
-            # Multi-metric trend chart
-            trend_data = filtered_hourly.groupby('hourly_timestamp').agg({
-                'total_occupied': 'sum',
-                'total_available': 'sum',
-                'avg_occupancy_rate': 'mean'
-            }).reset_index()
-
-            fig_trend = make_subplots(
-                rows=2, cols=1,
-                subplot_titles=('Connector Status Over Time', 'Average Occupancy Rate'),
-                vertical_spacing=0.1
-            )
-
-            # Add traces
-            fig_trend.add_trace(
-                go.Scatter(x=trend_data['hourly_timestamp'], y=trend_data['total_occupied'],
-                           name='Occupied', line=dict(color='#e74c3c')),
-                row=1, col=1
-            )
-            fig_trend.add_trace(
-                go.Scatter(x=trend_data['hourly_timestamp'], y=trend_data['total_available'],
-                           name='Available', line=dict(color='#2ecc71')),
-                row=1, col=1
-            )
-            fig_trend.add_trace(
-                go.Scatter(x=trend_data['hourly_timestamp'], y=trend_data['avg_occupancy_rate'] * 100,
-                           name='Occupancy %', line=dict(color='#3498db', width=3)),
-                row=2, col=1
-            )
-
-            fig_trend.update_yaxes(title_text="Count", row=1, col=1)
-            fig_trend.update_yaxes(title_text="Percentage", row=2, col=1)
-            fig_trend.update_layout(height=600, showlegend=True)
-
-            st.plotly_chart(fig_trend, use_container_width=True)
-        else:
-            st.info("No hourly trend data available")
-
-    with tab3:
-        # Power and Revenue Analysis
-        st.subheader("Power Consumption & Revenue Analysis")
-
-        if not filtered_sessions.empty:
-            # Ensure we have connector type data
-            if 'connector_type' not in filtered_sessions.columns:
-                # Try to get connector type from utilization data
-                if not filtered_util.empty and 'connector_type' in filtered_util.columns:
-                    connector_types = filtered_util.groupby('connector_id')['connector_type'].first()
-                    filtered_sessions = filtered_sessions.merge(
-                        connector_types, left_on='connector_id', right_index=True, how='left'
-                    )
-                else:
-                    # Create mock connector types based on connector_id patterns
-                    filtered_sessions['connector_type'] = 'Type2'  # Default fallback
-
-            # Group by connector type
-            if 'connector_type' in filtered_sessions.columns:
-                type_stats = filtered_sessions.groupby('connector_type').agg({
-                    'energy_kwh': ['sum', 'mean'],
-                    'revenue_nok': ['sum', 'mean'],
-                    'duration_hours': 'mean',
-                    'connector_id': 'count'
-                }).round(2)
-
-                # Flatten column names
-                type_stats.columns = ['total_energy', 'avg_energy', 'total_revenue', 'avg_revenue', 'avg_duration',
-                                      'session_count']
-                type_stats.reset_index(inplace=True)
-
-                col1, col2 = st.columns(2)
-
-                with col1:
-                    # Revenue by connector type
-                    fig_revenue_type = px.pie(
-                        type_stats,
-                        values='total_revenue',
-                        names='connector_type',
-                        title='Revenue Distribution by Connector Type',
-                        color_discrete_map={'CCS': '#3498db', 'CHAdeMO': '#9b59b6', 'Type2': '#1abc9c'}
-                    )
-                    st.plotly_chart(fig_revenue_type, use_container_width=True)
-
-                with col2:
-                    # Energy delivered by connector type
-                    fig_energy_type = px.bar(
-                        type_stats,
-                        x='connector_type',
-                        y='total_energy',
-                        title='Energy Delivered by Connector Type (kWh)',
-                        color='connector_type',
-                        color_discrete_map={'CCS': '#3498db', 'CHAdeMO': '#9b59b6', 'Type2': '#1abc9c'}
-                    )
-                    st.plotly_chart(fig_energy_type, use_container_width=True)
-
-            # Session statistics
-            st.markdown("---")
-            st.subheader("Session Statistics")
-
+            
+            st.plotly_chart(fig_revenue, use_container_width=True)
+            
+            # Power and revenue metrics
             col1, col2, col3, col4 = st.columns(4)
-
+            
             with col1:
-                total_energy = filtered_sessions['energy_kwh'].sum()
-                st.metric("Total Energy Delivered", f"{total_energy:,.0f} kWh")
-
+                total_energy = sessions_df['energy_kwh'].sum()
+                st.metric("Total Energy (24h)", f"{total_energy:,.0f} kWh")
+            
             with col2:
-                total_revenue = filtered_sessions['revenue_nok'].sum()
-                st.metric("Total Revenue", f"NOK {total_revenue:,.0f}", f"${total_revenue / 10.5:,.0f} USD")
-
+                total_revenue = sessions_df['revenue_nok'].sum()
+                st.metric("Total Revenue (24h)", f"NOK {total_revenue:,.0f}")
+            
             with col3:
-                avg_session_revenue = filtered_sessions['revenue_nok'].mean()
-                st.metric("Avg Revenue/Session", f"NOK {avg_session_revenue:.1f}")
-
+                avg_session_energy = sessions_df['energy_kwh'].mean()
+                st.metric("Avg Energy/Session", f"{avg_session_energy:.1f} kWh")
+            
             with col4:
-                avg_duration = filtered_sessions['duration_hours'].mean() * 60
-                st.metric("Avg Session Duration", f"{avg_duration:.0f} min")
-
+                avg_session_revenue = sessions_df['revenue_nok'].mean()
+                st.metric("Avg Revenue/Session", f"NOK {avg_session_revenue:.0f}")
+            
+            # Energy vs Revenue scatter
+            if len(sessions_df) > 1:
+                fig_scatter = px.scatter(
+                    sessions_df,
+                    x='energy_kwh',
+                    y='revenue_nok',
+                    title='Energy vs Revenue Relationship',
+                    labels={'energy_kwh': 'Energy (kWh)', 'revenue_nok': 'Revenue (NOK)'},
+                    trendline='ols',
+                    color_continuous_scale='viridis'
+                )
+                fig_scatter.update_layout(height=400)
+                st.plotly_chart(fig_scatter, use_container_width=True)
+        
         else:
-            st.info("No session data available for the selected time range")
-
+            st.info("No session data available for power and revenue analysis")
+    
     with tab4:
-        # Session Analysis
-        st.subheader("Detailed Session Analysis")
-
-        if not filtered_sessions.empty:
-            # Session duration and revenue distributions
+        st.subheader("Session Analysis")
+        
+        if not sessions_df.empty:
+            # Session duration analysis
             col1, col2 = st.columns(2)
-
+            
             with col1:
-                # Duration histogram
                 fig_duration = px.histogram(
-                    filtered_sessions,
+                    sessions_df,
                     x='duration_hours',
                     nbins=20,
                     title='Session Duration Distribution',
-                    labels={'duration_hours': 'Duration (hours)', 'count': 'Number of Sessions'}
+                    labels={'duration_hours': 'Duration (hours)', 'count': 'Sessions'}
                 )
                 fig_duration.update_traces(marker_color='#3498db')
+                fig_duration.update_layout(height=400)
                 st.plotly_chart(fig_duration, use_container_width=True)
-
+            
             with col2:
-                # Revenue per session histogram
                 fig_revenue_dist = px.histogram(
-                    filtered_sessions,
+                    sessions_df,
                     x='revenue_nok',
                     nbins=20,
-                    title='Revenue per Session Distribution',
-                    labels={'revenue_nok': 'Revenue (NOK)', 'count': 'Number of Sessions'}
+                    title='Revenue Distribution',
+                    labels={'revenue_nok': 'Revenue (NOK)', 'count': 'Sessions'}
                 )
                 fig_revenue_dist.update_traces(marker_color='#2ecc71')
+                fig_revenue_dist.update_layout(height=400)
                 st.plotly_chart(fig_revenue_dist, use_container_width=True)
-
+            
+            # Session metrics
+            col1, col2, col3, col4 = st.columns(4)
+            
+            with col1:
+                total_sessions = len(sessions_df)
+                st.metric("Total Sessions (24h)", total_sessions)
+            
+            with col2:
+                avg_duration = sessions_df['duration_hours'].mean() * 60
+                st.metric("Avg Duration", f"{avg_duration:.0f} min")
+            
+            with col3:
+                median_revenue = sessions_df['revenue_nok'].median()
+                st.metric("Median Revenue", f"NOK {median_revenue:.0f}")
+            
+            with col4:
+                max_energy = sessions_df['energy_kwh'].max()
+                st.metric("Max Energy", f"{max_energy:.1f} kWh")
+            
+            # Top connectors by revenue
+            st.subheader("🏆 Top Performing Connectors")
+            
+            top_connectors = sessions_df.groupby('connector_id').agg({
+                'revenue_nok': 'sum',
+                'energy_kwh': 'sum',
+                'duration_hours': ['count', 'mean']
+            }).round(2)
+            
+            top_connectors.columns = ['total_revenue', 'total_energy', 'session_count', 'avg_duration']
+            top_connectors = top_connectors.sort_values('total_revenue', ascending=False).head(10)
+            top_connectors = top_connectors.reset_index()
+            
+            # Format for display
+            display_df = top_connectors[['connector_id', 'total_revenue', 'total_energy', 'session_count']].copy()
+            display_df.columns = ['Connector ID', 'Revenue (NOK)', 'Energy (kWh)', 'Sessions']
+            
+            st.dataframe(display_df, hide_index=True, use_container_width=True)
+        
         else:
             st.info("No session data available for analysis")
 
-
-def show_realtime_monitor(stations_df, utilization_df, sessions_df):
-    """Show comprehensive real-time monitoring dashboard"""
+def show_realtime_dashboard(stations_df, latest_status_df, sessions_df):
+    """Real-time monitoring dashboard"""
     st.header("⚡ Real-time Station Monitor")
-
+    
     # Current status overview
     col1, col2, col3, col4 = st.columns(4)
-
-    if not utilization_df.empty:
-        current_available = len(utilization_df[utilization_df['is_available'] == 1])
-        current_occupied = len(utilization_df[utilization_df['is_occupied'] == 1])
-        current_out_of_order = len(utilization_df[utilization_df['is_out_of_order'] == 1])
-        total_connectors = len(utilization_df)
+    
+    if not latest_status_df.empty:
+        current_available = len(latest_status_df[latest_status_df['is_available'] == 1])
+        current_occupied = len(latest_status_df[latest_status_df['is_occupied'] == 1])
+        current_out_of_order = len(latest_status_df[latest_status_df['is_out_of_order'] == 1])
+        total_connectors = len(latest_status_df)
     else:
         current_available = 0
         current_occupied = 0
         current_out_of_order = 0
         total_connectors = stations_df['total_connectors'].sum() if not stations_df.empty else 0
-
+    
     with col1:
-        st.metric("🟢 Available Connectors", f"{current_available}/{total_connectors}")
+        st.metric("🟢 Available", f"{current_available}")
+    
     with col2:
-        st.metric("🟠 Occupied Connectors", f"{current_occupied}/{total_connectors}")
+        st.metric("🟠 Occupied", f"{current_occupied}")
+    
     with col3:
-        st.metric("🔴 Out of Order", current_out_of_order)
+        st.metric("🔴 Out of Order", f"{current_out_of_order}")
+    
     with col4:
-        current_utilization = (current_occupied / total_connectors * 100) if total_connectors > 0 else 0
-        st.metric("📊 Current Utilization", f"{current_utilization:.1f}%")
-
+        utilization = (current_occupied / total_connectors * 100) if total_connectors > 0 else 0
+        st.metric("📊 Utilization", f"{utilization:.1f}%")
+    
     st.markdown("---")
-
-    # Real-time revenue tracking
-    if not sessions_df.empty:
-        st.subheader("💰 Real-time Revenue Tracking")
-
-        col1, col2, col3 = st.columns(3)
-
-        now = datetime.now()
-        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-
-        with col1:
-            today_sessions = sessions_df[sessions_df['start_time'] >= today_start]
-            today_revenue = today_sessions['revenue_nok'].sum()
-            st.metric("Today's Revenue", f"NOK {today_revenue:,.0f}", f"${today_revenue / 10.5:,.0f} USD")
-
-        with col2:
-            last_hour = now - timedelta(hours=1)
-            last_hour_sessions = sessions_df[sessions_df['start_time'] >= last_hour]
-            last_hour_revenue = last_hour_sessions['revenue_nok'].sum()
-            st.metric("Last Hour Revenue", f"NOK {last_hour_revenue:,.0f}")
-
-        with col3:
-            st.metric("Active Sessions", current_occupied)
-
-    st.markdown("---")
-
-    # Real-time station grid
-    st.subheader("Station Status Grid")
-
-    # Search functionality
-    search_term = st.text_input("🔍 Search stations by name or address", key="realtime_search")
-
+    
+    # Filter options
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        search_term = st.text_input("🔍 Search stations by name or ID", "")
+    
+    with col2:
+        status_filter = st.selectbox(
+            "Filter by status",
+            ["All", "Available", "Occupied", "Out of Order"]
+        )
+    
+    # Filter stations
     if search_term and not stations_df.empty:
-        display_df = stations_df[
+        filtered_stations = stations_df[
             stations_df['name'].str.contains(search_term, case=False, na=False) |
-            stations_df['address'].str.contains(search_term, case=False, na=False)
-            ]
+            stations_df['id'].str.contains(search_term, case=False, na=False)
+        ]
     else:
-        display_df = stations_df
-
-    # Display grid
-    if not display_df.empty:
-        stations_per_row = 5
-        for i in range(0, len(display_df), stations_per_row):
+        filtered_stations = stations_df
+    
+    # Real-time station grid
+    if not filtered_stations.empty:
+        st.subheader("📍 Station Status Grid")
+        
+        # Display stations in grid format
+        stations_per_row = 4
+        for i in range(0, len(filtered_stations), stations_per_row):
             cols = st.columns(stations_per_row)
-
+            
             for j, col in enumerate(cols):
-                if i + j < len(display_df):
-                    station = display_df.iloc[i + j]
-
-                    # Get current status for this station
-                    if not utilization_df.empty:
-                        station_util = utilization_df[utilization_df['station_id'] == station['id']]
-                        occupied = len(station_util[station_util['is_occupied'] == 1])
-                        total = len(station_util) if len(station_util) > 0 else station['total_connectors']
+                if i + j < len(filtered_stations):
+                    station = filtered_stations.iloc[i + j]
+                    
+                    # Get current status
+                    station_connectors = latest_status_df[latest_status_df['station_id'] == station['id']] if not latest_status_df.empty else pd.DataFrame()
+                    
+                    if not station_connectors.empty:
+                        occupied = len(station_connectors[station_connectors['is_occupied'] == 1])
+                        available = len(station_connectors[station_connectors['is_available'] == 1])
+                        out_of_order = len(station_connectors[station_connectors['is_out_of_order'] == 1])
                     else:
                         occupied = 0
-                        total = station['total_connectors']
-
+                        available = station['total_connectors']
+                        out_of_order = 0
+                    
+                    # Determine card color
+                    if out_of_order == station['total_connectors']:
+                        card_color = "#e74c3c"
+                        icon = "🔴"
+                        status_text = "Out of Order"
+                    elif occupied == station['total_connectors']:
+                        card_color = "#f39c12"
+                        icon = "🟠"
+                        status_text = "Fully Occupied"
+                    elif available > 0:
+                        card_color = "#2ecc71"
+                        icon = "🟢"
+                        status_text = "Available"
+                    else:
+                        card_color = "#95a5a6"
+                        icon = "⚪"
+                        status_text = "Unknown"
+                    
+                    # Skip if status filter doesn't match
+                    if status_filter != "All":
+                        if status_filter == "Available" and available == 0:
+                            continue
+                        elif status_filter == "Occupied" and occupied == 0:
+                            continue
+                        elif status_filter == "Out of Order" and out_of_order == 0:
+                            continue
+                    
                     with col:
-                        # Determine card color based on occupancy
-                        if occupied == 0:
-                            card_color = "#2ecc71"
-                            icon = "✅"
-                        elif occupied < total:
-                            card_color = "#f39c12"
-                            icon = "🔌"
-                        else:
-                            card_color = "#e74c3c"
-                            icon = "⚡"
-
-                        # Create card
                         st.markdown(f"""
                         <div class="station-card" style="
-                            background-color: {card_color}20;
+                            background: linear-gradient(135deg, {card_color}20 0%, {card_color}10 100%);
                             border: 2px solid {card_color};
+                            min-height: 180px;
                         ">
-                            <h4 style="margin: 0; font-size: 0.9em;">{icon} {station['name'][:20]}...</h4>
-                            <p style="margin: 5px 0; font-size: 0.8em;"><b>{occupied}/{total} occupied</b></p>
-                            <p style="margin: 5px 0; font-size: 0.8em;">⚡ {station['total_connectors']} connectors</p>
-                            <p style="margin: 5px 0; font-size: 0.7em;">📍 {str(station.get('address', 'No address'))[:25]}...</p>
+                            <h4 style="margin: 0 0 10px 0; font-size: 0.9em; color: {card_color};">
+                                {icon} {station['name'][:25]}{'...' if len(station['name']) > 25 else ''}
+                            </h4>
+                            <p style="margin: 5px 0; font-size: 0.85em;"><b>{status_text}</b></p>
+                            <p style="margin: 5px 0; font-size: 0.8em;">
+                                🟢 {available} | 🟠 {occupied} | 🔴 {out_of_order}
+                            </p>
+                            <p style="margin: 5px 0; font-size: 0.8em;">⚡ {station['total_connectors']} total</p>
+                            <p style="margin: 5px 0; font-size: 0.7em; color: #666;">
+                                📍 {str(station.get('address', 'No address'))[:30]}{'...' if len(str(station.get('address', ''))) > 30 else ''}
+                            </p>
                         </div>
                         """, unsafe_allow_html=True)
-
+    
     # Recent activity feed
     st.markdown("---")
-    st.subheader("📰 Recent Session Activity")
-
+    st.subheader("📰 Recent Activity")
+    
     if not sessions_df.empty:
-        # Get recent sessions
-        recent_sessions = sessions_df.sort_values('start_time', ascending=False).head(10)
-
+        recent_sessions = sessions_df.sort_values('start_time', ascending=False).head(15)
+        
         for _, session in recent_sessions.iterrows():
-            # Get station name
-            if 'station_name' in session and pd.notna(session['station_name']):
-                station_name = session['station_name']
-            elif 'station_id' in session and pd.notna(session['station_id']):
-                station_match = stations_df[stations_df['id'] == session['station_id']]
-                station_name = station_match['name'].values[0] if len(station_match) > 0 else 'Unknown Station'
-            else:
-                station_name = 'Unknown Station'
-
-            time_ago = (datetime.now() - session['start_time']).total_seconds() / 60
-
+            # Calculate time ago
+            time_ago = (get_oslo_time().replace(tzinfo=None) - session['start_time']).total_seconds() / 60
+            
             if time_ago < 60:
-                time_str = f"{int(time_ago)} minutes ago"
+                time_str = f"{int(time_ago)}m ago"
             elif time_ago < 1440:
-                time_str = f"{int(time_ago / 60)} hours ago"
+                time_str = f"{int(time_ago / 60)}h ago"
             else:
-                time_str = f"{int(time_ago / 1440)} days ago"
-
+                time_str = f"{int(time_ago / 1440)}d ago"
+            
+            station_name = session.get('station_name', 'Unknown Station')
+            
             st.markdown(
-                f"• 🔌 Session at **{station_name}** - "
-                f"Duration: {session['duration_hours'] * 60:.0f} min, "
-                f"Energy: {session['energy_kwh']:.1f} kWh, "
-                f"Revenue: NOK {session['revenue_nok']:.0f} - "
-                f"*{time_str}*"
+                f"🔌 **{station_name}** - Duration: {session['duration_hours']*60:.0f}min, "
+                f"Energy: {session['energy_kwh']:.1f}kWh, Revenue: NOK {session['revenue_nok']:.0f} "
+                f"*({time_str})*"
             )
     else:
         st.info("No recent session activity to display")
 
-
 def show_data_explorer(stations_df, utilization_df, hourly_df, sessions_df):
-    """Show comprehensive data explorer interface"""
+    """Data explorer with filtering and export capabilities"""
     st.header("📋 Data Explorer")
-
+    
     # Dataset selector
     dataset = st.selectbox(
         "Select Dataset",
-        ["Charging Stations", "Utilization Data", "Hourly Aggregations", "Charging Sessions"],
-        key="data_explorer_dataset"
+        ["Charging Stations", "Utilization Data", "Hourly Data", "Charging Sessions"]
     )
-
-    # Get the appropriate dataframe and description
+    
+    # Get appropriate dataframe
     if dataset == "Charging Stations":
-        df = stations_df
-        description = "Complete list of all charging stations with their specifications and current status."
+        df = stations_df.copy()
+        description = "All charging stations with specifications and current status"
     elif dataset == "Utilization Data":
-        df = utilization_df
-        description = "Detailed connector-level utilization records showing real-time usage patterns."
-    elif dataset == "Hourly Aggregations":
-        df = hourly_df
-        description = "Hourly aggregated data showing utilization trends over time."
+        df = utilization_df.copy()
+        description = "Real-time connector utilization data (last 24 hours)"
+    elif dataset == "Hourly Data":
+        df = hourly_df.copy()
+        description = "Hourly aggregated utilization statistics"
     else:
-        df = sessions_df
-        description = "Completed charging sessions with duration, energy consumed, and revenue generated."
-
+        df = sessions_df.copy()
+        description = "Completed charging sessions (last 24 hours)"
+    
     st.markdown(f"*{description}*")
-
+    
     if df.empty:
         st.warning(f"No data available for {dataset}")
         return
-
-    # Data filters
-    st.subheader("🔍 Filters")
+    
+    # Filtering options
+    st.subheader("🔍 Data Filters")
+    
     col1, col2, col3 = st.columns(3)
-
-    filters = {}
-
-    # Dynamic filter creation based on dataset
+    
+    filters_applied = []
+    
+    # Dataset-specific filters
     if dataset == "Charging Stations":
         with col1:
             if 'status' in df.columns:
-                status_filter = st.multiselect("Status", df['status'].unique(), key="explorer_station_status")
-                if status_filter:
-                    filters['status'] = status_filter
-
+                status_values = df['status'].dropna().unique().tolist()
+                selected_status = st.multiselect("Status", status_values, default=status_values)
+                if len(selected_status) < len(status_values):
+                    df = df[df['status'].isin(selected_status)]
+                    filters_applied.append(f"Status: {', '.join(selected_status)}")
+        
         with col2:
-            if 'operator' in df.columns:
-                operator_filter = st.multiselect("Operator", df['operator'].unique(), key="explorer_station_operator")
-                if operator_filter:
-                    filters['operator'] = operator_filter
-
-        with col3:
             if 'total_connectors' in df.columns:
-                connector_range = st.slider(
-                    "Total Connectors",
-                    int(df['total_connectors'].min()),
-                    int(df['total_connectors'].max()),
-                    (int(df['total_connectors'].min()), int(df['total_connectors'].max())),
-                    key="explorer_station_connectors"
-                )
-                filters['total_connectors'] = connector_range
-
-    elif dataset == "Utilization Data":
-        with col1:
-            if 'status' in df.columns:
-                status_filter = st.multiselect("Status", df['status'].unique(), key="explorer_util_status")
-                if status_filter:
-                    filters['status'] = status_filter
-
-        with col2:
-            if 'connector_type' in df.columns:
-                connector_type_filter = st.multiselect("Connector Type", df['connector_type'].unique(),
-                                                       key="explorer_util_type")
-                if connector_type_filter:
-                    filters['connector_type'] = connector_type_filter
-
+                min_conn, max_conn = int(df['total_connectors'].min()), int(df['total_connectors'].max())
+                conn_range = st.slider("Total Connectors", min_conn, max_conn, (min_conn, max_conn))
+                df = df[(df['total_connectors'] >= conn_range[0]) & (df['total_connectors'] <= conn_range[1])]
+                if conn_range != (min_conn, max_conn):
+                    filters_applied.append(f"Connectors: {conn_range[0]}-{conn_range[1]}")
+        
         with col3:
-            occupied_filter = st.radio("Occupancy", ["All", "Occupied", "Available"], key="explorer_util_occupancy")
-            if occupied_filter == "Occupied":
-                filters['is_occupied'] = 1
-            elif occupied_filter == "Available":
-                filters['is_occupied'] = 0
-
+            if 'operator' in df.columns:
+                operators = df['operator'].dropna().unique().tolist()
+                selected_operators = st.multiselect("Operator", operators, default=operators)
+                if len(selected_operators) < len(operators):
+                    df = df[df['operator'].isin(selected_operators)]
+                    filters_applied.append(f"Operators: {', '.join(selected_operators)}")
+    
     elif dataset == "Charging Sessions":
         with col1:
             if 'revenue_nok' in df.columns:
-                revenue_range = st.slider(
-                    "Revenue Range (NOK)",
-                    float(df['revenue_nok'].min()),
-                    float(df['revenue_nok'].max()),
-                    (float(df['revenue_nok'].min()), float(df['revenue_nok'].max())),
-                    key="explorer_sessions_revenue"
-                )
-                filters['revenue_nok'] = revenue_range
-
+                min_rev, max_rev = float(df['revenue_nok'].min()), float(df['revenue_nok'].max())
+                rev_range = st.slider("Revenue (NOK)", min_rev, max_rev, (min_rev, max_rev))
+                df = df[(df['revenue_nok'] >= rev_range[0]) & (df['revenue_nok'] <= rev_range[1])]
+                if rev_range != (min_rev, max_rev):
+                    filters_applied.append(f"Revenue: NOK {rev_range[0]:.0f}-{rev_range[1]:.0f}")
+        
         with col2:
             if 'duration_hours' in df.columns:
-                duration_range = st.slider(
-                    "Duration (hours)",
-                    float(df['duration_hours'].min()),
-                    float(df['duration_hours'].max()),
-                    (float(df['duration_hours'].min()), float(df['duration_hours'].max())),
-                    key="explorer_sessions_duration"
-                )
-                filters['duration_hours'] = duration_range
-
-    # Apply filters
-    filtered_df = df.copy()
-
-    for col, value in filters.items():
-        if col in ['total_connectors', 'revenue_nok', 'duration_hours']:
-            filtered_df = filtered_df[
-                (filtered_df[col] >= value[0]) &
-                (filtered_df[col] <= value[1])
-                ]
-        elif isinstance(value, list):
-            filtered_df = filtered_df[filtered_df[col].isin(value)]
-        else:
-            filtered_df = filtered_df[filtered_df[col] == value]
-
-    # Display statistics
-    st.subheader("📊 Statistics")
-
+                min_dur, max_dur = float(df['duration_hours'].min()), float(df['duration_hours'].max())
+                dur_range = st.slider("Duration (hours)", min_dur, max_dur, (min_dur, max_dur))
+                df = df[(df['duration_hours'] >= dur_range[0]) & (df['duration_hours'] <= dur_range[1])]
+                if dur_range != (min_dur, max_dur):
+                    filters_applied.append(f"Duration: {dur_range[0]:.1f}-{dur_range[1]:.1f}h")
+        
+        with col3:
+            if 'energy_kwh' in df.columns:
+                min_energy, max_energy = float(df['energy_kwh'].min()), float(df['energy_kwh'].max())
+                energy_range = st.slider("Energy (kWh)", min_energy, max_energy, (min_energy, max_energy))
+                df = df[(df['energy_kwh'] >= energy_range[0]) & (df['energy_kwh'] <= energy_range[1])]
+                if energy_range != (min_energy, max_energy):
+                    filters_applied.append(f"Energy: {energy_range[0]:.1f}-{energy_range[1]:.1f} kWh")
+    
+    # Display applied filters
+    if filters_applied:
+        st.info(f"**Active filters:** {' | '.join(filters_applied)}")
+    
+    # Data summary
+    st.subheader("📊 Data Summary")
+    
     col1, col2, col3, col4 = st.columns(4)
-
+    
     with col1:
         st.metric("Total Records", f"{len(df):,}")
+    
     with col2:
-        st.metric("Filtered Records", f"{len(filtered_df):,}")
+        st.metric("Columns", len(df.columns))
+    
     with col3:
-        st.metric("Columns", len(filtered_df.columns))
+        memory_mb = df.memory_usage(deep=True).sum() / 1024**2
+        st.metric("Memory Usage", f"{memory_mb:.1f} MB")
+    
     with col4:
-        if dataset == "Charging Sessions" and not filtered_df.empty and 'revenue_nok' in filtered_df.columns:
-            total_revenue = filtered_df['revenue_nok'].sum()
+        if dataset == "Charging Sessions" and 'revenue_nok' in df.columns:
+            total_revenue = df['revenue_nok'].sum()
             st.metric("Total Revenue", f"NOK {total_revenue:,.0f}")
-        elif 'timestamp' in filtered_df.columns:
-            if not filtered_df.empty:
-                date_range = f"{filtered_df['timestamp'].min().strftime('%Y-%m-%d')} to {filtered_df['timestamp'].max().strftime('%Y-%m-%d')}"
-                st.metric("Date Range", date_range)
         else:
-            memory_usage = filtered_df.memory_usage().sum() / 1024 ** 2
-            st.metric("Memory Usage", f"{memory_usage:.1f} MB")
-
+            non_null_pct = (df.count().sum() / (len(df) * len(df.columns)) * 100)
+            st.metric("Data Completeness", f"{non_null_pct:.1f}%")
+    
     # Data preview
     st.subheader("📋 Data Preview")
-
-    # Column selector
-    if st.checkbox("Select specific columns", key="explorer_column_selector"):
-        selected_columns = st.multiselect("Choose columns", filtered_df.columns.tolist(),
-                                          default=filtered_df.columns.tolist(), key="explorer_columns")
-        if selected_columns:
-            display_df = filtered_df[selected_columns]
-        else:
-            display_df = filtered_df
-    else:
-        display_df = filtered_df
-
-    # Display options
-    col1, col2 = st.columns(2)
+    
+    col1, col2, col3 = st.columns(3)
+    
     with col1:
-        n_rows = st.number_input("Number of rows to display", min_value=10, max_value=1000, value=100, step=10,
-                                 key="explorer_rows")
+        show_columns = st.multiselect(
+            "Select columns to display",
+            df.columns.tolist(),
+            default=df.columns.tolist()[:10] if len(df.columns) > 10 else df.columns.tolist()
+        )
+    
     with col2:
-        if not display_df.empty:
-            sort_by = st.selectbox("Sort by", display_df.columns.tolist(), key="explorer_sort")
-            sort_order = st.radio("Order", ["Ascending", "Descending"], horizontal=True, key="explorer_order")
+        n_rows = st.number_input("Rows to display", min_value=10, max_value=1000, value=50)
+    
+    with col3:
+        if show_columns:
+            sort_column = st.selectbox("Sort by", show_columns)
+            sort_ascending = st.checkbox("Ascending", value=True)
         else:
-            sort_by = None
-            sort_order = "Ascending"
-
-    # Sort and display
-    if not display_df.empty and sort_by:
-        display_df = display_df.sort_values(sort_by, ascending=(sort_order == "Ascending"))
-
+            sort_column = None
+            sort_ascending = True
+    
+    # Apply column selection and sorting
+    if show_columns:
+        display_df = df[show_columns].copy()
+        
+        if sort_column and sort_column in display_df.columns:
+            display_df = display_df.sort_values(sort_column, ascending=sort_ascending)
+        
+        # Display data
         st.dataframe(
             display_df.head(n_rows),
             use_container_width=True,
             hide_index=True
         )
-    else:
-        st.info("No data to display")
-
-    # Download options
-    if not display_df.empty:
+        
+        # Export options
         st.subheader("💾 Export Data")
-
+        
         col1, col2, col3 = st.columns(3)
-
+        
         with col1:
-            csv = display_df.to_csv(index=False)
+            csv_data = display_df.to_csv(index=False)
             st.download_button(
-                label="📥 Download as CSV",
-                data=csv,
-                file_name=f"{dataset.lower().replace(' ', '_')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                mime="text/csv",
-                key="download_csv"
+                label="📥 Download CSV",
+                data=csv_data,
+                file_name=f"{dataset.lower().replace(' ', '_')}_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                mime="text/csv"
             )
-
+        
         with col2:
-            # Create Excel download
-            try:
-                import io
-                buffer = io.BytesIO()
-                with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-                    display_df.to_excel(writer, sheet_name='Data', index=False)
-
-                st.download_button(
-                    label="📥 Download as Excel",
-                    data=buffer.getvalue(),
-                    file_name=f"{dataset.lower().replace(' ', '_')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key="download_excel"
-                )
-            except ImportError:
-                st.info("Install xlsxwriter for Excel export: pip install xlsxwriter")
-
-        with col3:
             # Summary statistics
-            if st.button("📊 Generate Summary Report", key="explorer_summary"):
-                summary = display_df.describe(include='all').to_string()
+            if st.button("📊 Generate Summary"):
+                summary_stats = display_df.describe(include='all').to_string()
                 st.download_button(
                     label="📥 Download Summary",
-                    data=summary,
-                    file_name=f"{dataset.lower().replace(' ', '_')}_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
-                    mime="text/plain",
-                    key="download_summary"
+                    data=summary_stats,
+                    file_name=f"{dataset.lower().replace(' ', '_')}_summary_{datetime.now().strftime('%Y%m%d_%H%M')}.txt",
+                    mime="text/plain"
                 )
+        
+        with col3:
+            # Basic insights
+            if dataset == "Charging Sessions" and not display_df.empty:
+                total_sessions = len(display_df)
+                total_revenue = display_df['revenue_nok'].sum() if 'revenue_nok' in display_df.columns else 0
+                avg_duration = display_df['duration_hours'].mean() * 60 if 'duration_hours' in display_df.columns else 0
+                
+                insights = f"""
+Data Insights Report
+Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
+Total Sessions: {total_sessions:,}
+Total Revenue: NOK {total_revenue:,.2f}
+Average Duration: {avg_duration:.1f} minutes
+Date Range: {df['start_time'].min()} to {df['start_time'].max()}
+                """
+                
+                st.download_button(
+                    label="📥 Download Insights",
+                    data=insights,
+                    file_name=f"session_insights_{datetime.now().strftime('%Y%m%d_%H%M')}.txt",
+                    mime="text/plain"
+                )
+    else:
+        st.warning("Please select at least one column to display")
 
 # Footer
 def add_footer():
     st.markdown("---")
-    st.markdown("""
-    <div style="text-align: center; color: #666; padding: 20px;">
-        <p>⚡ EV Charging Analytics Dashboard | MySQL Backend | Auto-refresh Enabled</p>
-        <p>Data updates automatically every 60 seconds</p>
-    </div>
-    """, unsafe_allow_html=True)
-
+    st.markdown(
+        f"""
+        <div style="text-align: center; color: #666; padding: 20px; font-size: 0.9em;">
+            <p>⚡ <b>EV Charging Analytics Dashboard</b> | Connected to Railway MySQL</p>
+            <p>🔄 Auto-refresh enabled (60s) | 📊 Last updated: {get_oslo_time().strftime('%Y-%m-%d %H:%M:%S')} CET</p>
+            <p>🚀 Built with Streamlit | 📡 Real-time data from utilization_data, charging_sessions, hourly_utilization</p>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
 
 if __name__ == "__main__":
-    # Handle deployment errors gracefully - database required
-    handle_deployment_errors()
-
-    # Run main dashboard
     main()
     add_footer()
