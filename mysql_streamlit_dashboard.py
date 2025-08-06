@@ -234,17 +234,17 @@ def load_utilization_data():
         
         latest_time = latest_result['latest_time'].iloc[0]
         
-        # Calculate 24 hours before the latest timestamp
-        query = """
+        # Calculate 24 hours before the latest timestamp using string formatting
+        query = f"""
         SELECT 
             timestamp, hourly_timestamp, station_id, connector_id, connector_type,
             power, status, is_occupied, is_available, is_out_of_order, tariff
         FROM utilization_data
-        WHERE timestamp >= DATE_SUB(%s, INTERVAL 24 HOUR)
+        WHERE timestamp >= DATE_SUB('{latest_time}', INTERVAL 24 HOUR)
         ORDER BY timestamp DESC
         """
         
-        df = pd.read_sql(query, engine, params=[latest_time])
+        df = pd.read_sql(query, engine)
         if not df.empty:
             df['timestamp'] = pd.to_datetime(df['timestamp'])
             df['hourly_timestamp'] = pd.to_datetime(df['hourly_timestamp'])
@@ -274,16 +274,16 @@ def load_hourly_data():
         latest_time = latest_result['latest_time'].iloc[0]
         
         # Get 24 hours of data from the latest available timestamp
-        query = """
+        query = f"""
         SELECT 
             hourly_timestamp, station_id, is_available, is_occupied, 
             is_out_of_order, total_connectors, occupancy_rate, availability_rate
         FROM hourly_utilization
-        WHERE hourly_timestamp >= DATE_SUB(%s, INTERVAL 24 HOUR)
+        WHERE hourly_timestamp >= DATE_SUB('{latest_time}', INTERVAL 24 HOUR)
         ORDER BY hourly_timestamp DESC
         """
         
-        df = pd.read_sql(query, engine, params=[latest_time])
+        df = pd.read_sql(query, engine)
         if not df.empty:
             df['hourly_timestamp'] = pd.to_datetime(df['hourly_timestamp'])
             
@@ -312,18 +312,18 @@ def load_sessions_data():
         latest_time = latest_result['latest_time'].iloc[0]
         
         # Get 24 hours of session data from the latest available timestamp
-        query = """
+        query = f"""
         SELECT 
             s.connector_id, s.station_id, s.start_time, s.end_time,
             s.duration_hours, s.energy_kwh, s.revenue_nok,
             st.name as station_name, st.address as station_address
         FROM charging_sessions s
         LEFT JOIN charging_stations st ON s.station_id = st.id
-        WHERE s.end_time >= DATE_SUB(%s, INTERVAL 24 HOUR)
+        WHERE s.end_time >= DATE_SUB('{latest_time}', INTERVAL 24 HOUR)
         ORDER BY s.end_time DESC
         """
         
-        df = pd.read_sql(query, engine, params=[latest_time])
+        df = pd.read_sql(query, engine)
         if not df.empty:
             df['start_time'] = pd.to_datetime(df['start_time'])
             df['end_time'] = pd.to_datetime(df['end_time'])
@@ -351,18 +351,18 @@ def get_latest_connector_status():
         latest_time = latest_result['latest_time'].iloc[0]
         
         # Get latest status for each connector within the last 2 hours from latest data
-        query = """
+        query = f"""
         SELECT u1.*
         FROM utilization_data u1
         INNER JOIN (
             SELECT connector_id, MAX(timestamp) as max_timestamp
             FROM utilization_data
-            WHERE timestamp >= DATE_SUB(%s, INTERVAL 2 HOUR)
+            WHERE timestamp >= DATE_SUB('{latest_time}', INTERVAL 2 HOUR)
             GROUP BY connector_id
         ) u2 ON u1.connector_id = u2.connector_id AND u1.timestamp = u2.max_timestamp
         """
         
-        df = pd.read_sql(query, engine, params=[latest_time])
+        df = pd.read_sql(query, engine)
         if not df.empty:
             df['timestamp'] = pd.to_datetime(df['timestamp'])
             
