@@ -304,7 +304,6 @@ if 'data_loaded' not in st.session_state:
 REFRESH_INTERVAL = 60
 
 
-# More efficient data loading with better caching strategy
 @st.cache_data(ttl=60, show_spinner=False)
 def load_utilization_data():
     """Load latest utilization data from MySQL, fallback to older data if recent not available"""
@@ -374,6 +373,31 @@ def load_hourly_data():
         st.stop()
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def load_stations_data():
+    """Load charging stations data from MySQL"""
+    if not MYSQL_AVAILABLE or engine is None:
+        st.error("❌ Database connection required. Please configure MySQL credentials.")
+        st.stop()
+
+    try:
+        df = load_from_mysql('charging_stations')
+        if df.empty:
+            st.warning("⚠️ No stations data found in database.")
+            st.stop()
+
+        # Ensure numeric columns are properly typed
+        numeric_cols = ['latitude', 'longitude', 'total_connectors', 'ccs_connectors',
+                        'chademo_connectors', 'type2_connectors', 'other_connectors']
+        for col in numeric_cols:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+        return df
+    except Exception as e:
+        st.error(f"❌ Error loading stations from database: {e}")
+        st.stop()
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def load_sessions_data():
     """Load recent charging sessions from MySQL, fallback to older data"""
@@ -395,7 +419,6 @@ def load_sessions_data():
     except Exception as e:
         st.error(f"❌ Error loading sessions data: {e}")
         st.stop()
-
 
 # Helper function to format CEST time
 def format_cest_time(dt):
