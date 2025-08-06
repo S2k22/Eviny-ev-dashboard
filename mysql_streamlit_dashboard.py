@@ -189,10 +189,10 @@ def format_oslo_time(dt):
         dt = pytz.utc.localize(dt)
     return dt.astimezone(OSLO_TZ)
 
-# Optimized data loading functions
-@st.cache_data(ttl=60)  # Cache for 1 minute
+# Optimized data loading functions with better caching and performance
+@st.cache_data(ttl=300, show_spinner="Loading stations data...")  # Cache for 5 minutes
 def load_stations_data():
-    """Load charging stations data"""
+    """Load charging stations data - cached for better performance"""
     query = """
     SELECT 
         id, name, operator, status, address, description,
@@ -201,40 +201,40 @@ def load_stations_data():
         amenities, last_updated
     FROM charging_stations
     WHERE latitude IS NOT NULL AND longitude IS NOT NULL
+    LIMIT 1000
     """
     
     try:
         df = pd.read_sql(query, engine)
         if df.empty:
-            st.warning("⚠️ No charging stations found in database")
             return pd.DataFrame()
         
-        # Convert numeric columns
+        # Convert numeric columns efficiently
         numeric_cols = ['latitude', 'longitude', 'total_connectors', 
                        'ccs_connectors', 'chademo_connectors', 'type2_connectors', 'other_connectors']
         for col in numeric_cols:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
         
         return df
     except Exception as e:
         st.error(f"Error loading stations: {e}")
         return pd.DataFrame()
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=300, show_spinner="Loading utilization data...")  # Cache for 5 minutes
 def load_utilization_data():
-    """Load latest available 24 hours of utilization data"""
+    """Load latest available 24 hours of utilization data - optimized"""
     try:
-        # First, find the latest timestamp in the data
-        latest_query = "SELECT MAX(timestamp) as latest_time FROM utilization_data"
+        # Get latest timestamp more efficiently
+        latest_query = "SELECT MAX(timestamp) as latest_time FROM utilization_data LIMIT 1"
         latest_result = pd.read_sql(latest_query, engine)
         
-        if latest_result.empty or latest_result['latest_time'].iloc[0] is None:
-            st.warning("No utilization data found in database")
+        if latest_result.empty or pd.isna(latest_result['latest_time'].iloc[0]):
             return pd.DataFrame()
         
         latest_time = latest_result['latest_time'].iloc[0]
         
-        # Calculate 24 hours before the latest timestamp using string formatting
+        # More efficient query with LIMIT
         query = f"""
         SELECT 
             timestamp, hourly_timestamp, station_id, connector_id, connector_type,
@@ -242,38 +242,33 @@ def load_utilization_data():
         FROM utilization_data
         WHERE timestamp >= DATE_SUB('{latest_time}', INTERVAL 24 HOUR)
         ORDER BY timestamp DESC
+        LIMIT 10000
         """
         
         df = pd.read_sql(query, engine)
         if not df.empty:
             df['timestamp'] = pd.to_datetime(df['timestamp'])
             df['hourly_timestamp'] = pd.to_datetime(df['hourly_timestamp'])
-            
-            # Log the data period for debugging
-            data_start = df['timestamp'].min()
-            data_end = df['timestamp'].max()
-            st.sidebar.info(f"📊 Utilization Data Period: {data_start.strftime('%Y-%m-%d %H:%M')} to {data_end.strftime('%Y-%m-%d %H:%M')}")
-            
+        
         return df
     except Exception as e:
         st.error(f"Error loading utilization data: {e}")
         return pd.DataFrame()
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=300, show_spinner="Loading hourly data...")
 def load_hourly_data():
-    """Load latest available 24 hours of hourly aggregated data"""
+    """Load latest available 24 hours of hourly aggregated data - optimized"""
     try:
-        # First, find the latest timestamp in hourly data
-        latest_query = "SELECT MAX(hourly_timestamp) as latest_time FROM hourly_utilization"
+        # Get latest timestamp efficiently
+        latest_query = "SELECT MAX(hourly_timestamp) as latest_time FROM hourly_utilization LIMIT 1"
         latest_result = pd.read_sql(latest_query, engine)
         
-        if latest_result.empty or latest_result['latest_time'].iloc[0] is None:
-            st.warning("No hourly utilization data found in database")
+        if latest_result.empty or pd.isna(latest_result['latest_time'].iloc[0]):
             return pd.DataFrame()
         
         latest_time = latest_result['latest_time'].iloc[0]
         
-        # Get 24 hours of data from the latest available timestamp
+        # Optimized query with LIMIT
         query = f"""
         SELECT 
             hourly_timestamp, station_id, is_available, is_occupied, 
@@ -281,37 +276,32 @@ def load_hourly_data():
         FROM hourly_utilization
         WHERE hourly_timestamp >= DATE_SUB('{latest_time}', INTERVAL 24 HOUR)
         ORDER BY hourly_timestamp DESC
+        LIMIT 1000
         """
         
         df = pd.read_sql(query, engine)
         if not df.empty:
             df['hourly_timestamp'] = pd.to_datetime(df['hourly_timestamp'])
-            
-            # Log the data period for debugging
-            data_start = df['hourly_timestamp'].min()
-            data_end = df['hourly_timestamp'].max()
-            st.sidebar.info(f"⏱️ Hourly Data Period: {data_start.strftime('%Y-%m-%d %H:%M')} to {data_end.strftime('%Y-%m-%d %H:%M')}")
-            
+        
         return df
     except Exception as e:
         st.error(f"Error loading hourly data: {e}")
         return pd.DataFrame()
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=300, show_spinner="Loading sessions data...")
 def load_sessions_data():
-    """Load latest available 24 hours of charging sessions"""
+    """Load latest available 24 hours of charging sessions - optimized"""
     try:
-        # First, find the latest end_time in sessions data
-        latest_query = "SELECT MAX(end_time) as latest_time FROM charging_sessions"
+        # Get latest timestamp efficiently
+        latest_query = "SELECT MAX(end_time) as latest_time FROM charging_sessions LIMIT 1"
         latest_result = pd.read_sql(latest_query, engine)
         
-        if latest_result.empty or latest_result['latest_time'].iloc[0] is None:
-            st.warning("No charging sessions found in database")
+        if latest_result.empty or pd.isna(latest_result['latest_time'].iloc[0]):
             return pd.DataFrame()
         
         latest_time = latest_result['latest_time'].iloc[0]
         
-        # Get 24 hours of session data from the latest available timestamp
+        # Optimized query with LIMIT
         query = f"""
         SELECT 
             s.connector_id, s.station_id, s.start_time, s.end_time,
@@ -321,170 +311,133 @@ def load_sessions_data():
         LEFT JOIN charging_stations st ON s.station_id = st.id
         WHERE s.end_time >= DATE_SUB('{latest_time}', INTERVAL 24 HOUR)
         ORDER BY s.end_time DESC
+        LIMIT 5000
         """
         
         df = pd.read_sql(query, engine)
         if not df.empty:
             df['start_time'] = pd.to_datetime(df['start_time'])
             df['end_time'] = pd.to_datetime(df['end_time'])
-            
-            # Log the data period for debugging
-            data_start = df['end_time'].min()
-            data_end = df['end_time'].max()
-            st.sidebar.info(f"🔌 Sessions Data Period: {data_start.strftime('%Y-%m-%d %H:%M')} to {data_end.strftime('%Y-%m-%d %H:%M')}")
-            
+        
         return df
     except Exception as e:
         st.error(f"Error loading sessions data: {e}")
         return pd.DataFrame()
 
+@st.cache_data(ttl=300, show_spinner="Loading connector status...")
 def get_latest_connector_status():
-    """Get latest status for each connector from the most recent available data"""
+    """Get latest status for each connector - optimized"""
     try:
-        # First, find the latest timestamp in utilization data
-        latest_query = "SELECT MAX(timestamp) as latest_time FROM utilization_data"
-        latest_result = pd.read_sql(latest_query, engine)
-        
-        if latest_result.empty or latest_result['latest_time'].iloc[0] is None:
-            return pd.DataFrame()
-        
-        latest_time = latest_result['latest_time'].iloc[0]
-        
-        # Get latest status for each connector within the last 2 hours from latest data
-        query = f"""
-        SELECT u1.*
+        # Simplified query for better performance
+        query = """
+        SELECT 
+            station_id, connector_id, connector_type, status,
+            is_occupied, is_available, is_out_of_order, timestamp
         FROM utilization_data u1
-        INNER JOIN (
-            SELECT connector_id, MAX(timestamp) as max_timestamp
-            FROM utilization_data
-            WHERE timestamp >= DATE_SUB('{latest_time}', INTERVAL 2 HOUR)
-            GROUP BY connector_id
-        ) u2 ON u1.connector_id = u2.connector_id AND u1.timestamp = u2.max_timestamp
+        WHERE timestamp >= DATE_SUB((SELECT MAX(timestamp) FROM utilization_data), INTERVAL 2 HOUR)
+        ORDER BY timestamp DESC
+        LIMIT 2000
         """
         
         df = pd.read_sql(query, engine)
         if not df.empty:
             df['timestamp'] = pd.to_datetime(df['timestamp'])
-            
-            # Log latest connector status time
-            latest_status_time = df['timestamp'].max()
-            st.sidebar.success(f"🔄 Latest Status: {latest_status_time.strftime('%Y-%m-%d %H:%M:%S')}")
-            
+            # Keep only the latest record for each connector
+            df = df.drop_duplicates(subset=['connector_id'], keep='first')
+        
         return df
     except Exception as e:
         st.error(f"Error loading latest connector status: {e}")
         return pd.DataFrame()
 
-# Auto-refresh functionality
+# Auto-refresh functionality - simplified and optional
 def setup_auto_refresh():
-    """Setup auto-refresh mechanism"""
+    """Setup optional auto-refresh mechanism"""
+    if 'auto_refresh_enabled' not in st.session_state:
+        st.session_state.auto_refresh_enabled = False  # Disabled by default
+    
     if 'last_refresh' not in st.session_state:
         st.session_state.last_refresh = time.time()
-    
-    # Auto-refresh every 60 seconds
-    if time.time() - st.session_state.last_refresh > 60:
-        st.session_state.last_refresh = time.time()
-        st.cache_data.clear()
-        st.rerun()
 
 def show_refresh_status():
-    """Show refresh status indicator"""
-    time_since_refresh = int(time.time() - st.session_state.get('last_refresh', time.time()))
-    next_refresh = 60 - time_since_refresh
-    
-    if next_refresh > 0:
-        st.markdown(
-            f'<div class="refresh-info">🔄 Next refresh in {next_refresh}s</div>',
-            unsafe_allow_html=True
-        )
-    else:
-        st.markdown(
-            '<div class="refresh-info">🔄 Refreshing...</div>',
-            unsafe_allow_html=True
-        )
+    """Show refresh status indicator - only if enabled"""
+    if st.session_state.get('auto_refresh_enabled', False):
+        time_since_refresh = int(time.time() - st.session_state.get('last_refresh', time.time()))
+        next_refresh = 300 - time_since_refresh  # 5 minute intervals
+        
+        if next_refresh > 0:
+            st.markdown(
+                f'<div class="refresh-info">🔄 Auto-refresh in {next_refresh//60}m {next_refresh%60}s</div>',
+                unsafe_allow_html=True
+            )
+        else:
+            st.markdown(
+                '<div class="refresh-info">🔄 Refreshing...</div>',
+                unsafe_allow_html=True
+            )
+            if time.time() - st.session_state.last_refresh > 300:  # 5 minutes
+                st.session_state.last_refresh = time.time()
+                st.cache_data.clear()
+                st.rerun()
 
-# Main application
+# Main application with better navigation
 def main():
-    setup_auto_refresh()
+    # No auto-refresh to prevent performance issues
     
     # Header
     st.markdown('<h1 class="main-header">⚡ EV Charging Analytics Dashboard</h1>', unsafe_allow_html=True)
-    show_refresh_status()
     
-    # Load all data
-    with st.spinner('Loading data...'):
-        stations_df = load_stations_data()
-        utilization_df = load_utilization_data()
-        hourly_df = load_hourly_data()
-        sessions_df = load_sessions_data()
-        latest_status_df = get_latest_connector_status()
-    
-    # Sidebar navigation
+    # Sidebar navigation first (before loading data)
     with st.sidebar:
         st.markdown("### 🧭 Navigation")
         page = st.selectbox(
             "Select Dashboard",
             ["📊 Overview", "🗺️ Station Map", "📈 Utilization Analysis", 
-             "⚡ Real-time Monitor", "📋 Data Explorer"]
+             "⚡ Real-time Monitor", "📋 Data Explorer"],
+            key="main_navigation"  # Unique key to prevent issues
         )
         
         st.markdown("---")
-        st.markdown("### ⏱️ Data Status")
-        
-        # Get data availability info
-        try:
-            # Check latest data timestamps
-            util_latest = pd.read_sql("SELECT MAX(timestamp) as latest FROM utilization_data", engine)['latest'].iloc[0]
-            sessions_latest = pd.read_sql("SELECT MAX(end_time) as latest FROM charging_sessions", engine)['latest'].iloc[0]
-            hourly_latest = pd.read_sql("SELECT MAX(hourly_timestamp) as latest FROM hourly_utilization", engine)['latest'].iloc[0]
-            
-            if util_latest:
-                age_hours = (datetime.now() - util_latest.replace(tzinfo=None)).total_seconds() / 3600
-                if age_hours < 2:
-                    st.success(f"🟢 Live ({age_hours:.1f}h ago)")
-                elif age_hours < 24:
-                    st.warning(f"🟡 Recent ({age_hours:.1f}h ago)")
-                else:
-                    st.info(f"🔵 Historical ({age_hours/24:.1f}d ago)")
-            else:
-                st.error("🔴 No data available")
-                
-        except Exception as e:
-            st.info(f"Last updated: {get_oslo_time().strftime('%H:%M:%S')}")
-        
-        # Quick stats
-        st.markdown("### 📊 Quick Stats")
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.metric("Stations", len(stations_df))
-            occupied = len(latest_status_df[latest_status_df['is_occupied'] == 1]) if not latest_status_df.empty else 0
-            st.metric("Active", occupied)
-        
-        with col2:
-            total_connectors = stations_df['total_connectors'].sum() if not stations_df.empty else 0
-            st.metric("Connectors", total_connectors)
-            
-            if not sessions_df.empty:
-                daily_revenue = sessions_df['revenue_nok'].sum()
-                st.metric("Revenue", f"NOK {daily_revenue:,.0f}")
-        
-        st.markdown("---")
-        if st.button("🔄 Refresh Data"):
+        if st.button("🔄 Refresh Data", key="refresh_btn"):
             st.cache_data.clear()
-            st.session_state.last_refresh = time.time()
             st.rerun()
     
-    # Route to appropriate dashboard
+    # Load data only when needed based on selected page
     if page == "📊 Overview":
-        show_overview_dashboard(stations_df, utilization_df, hourly_df, sessions_df, latest_status_df)
+        with st.spinner('Loading overview data...'):
+            stations_df = load_stations_data()
+            utilization_df = load_utilization_data()
+            sessions_df = load_sessions_data()
+            latest_status_df = get_latest_connector_status()
+        show_overview_dashboard(stations_df, utilization_df, pd.DataFrame(), sessions_df, latest_status_df)
+        
     elif page == "🗺️ Station Map":
+        with st.spinner('Loading map data...'):
+            stations_df = load_stations_data()
+            latest_status_df = get_latest_connector_status()
+            sessions_df = load_sessions_data()
         show_map_dashboard(stations_df, latest_status_df, sessions_df)
+        
     elif page == "📈 Utilization Analysis":
+        with st.spinner('Loading utilization data...'):
+            utilization_df = load_utilization_data()
+            hourly_df = load_hourly_data()
+            sessions_df = load_sessions_data()
         show_utilization_dashboard(utilization_df, hourly_df, sessions_df)
+        
     elif page == "⚡ Real-time Monitor":
+        with st.spinner('Loading monitor data...'):
+            stations_df = load_stations_data()
+            latest_status_df = get_latest_connector_status()
+            sessions_df = load_sessions_data()
         show_realtime_dashboard(stations_df, latest_status_df, sessions_df)
+        
     else:  # Data Explorer
+        with st.spinner('Loading explorer data...'):
+            stations_df = load_stations_data()
+            utilization_df = load_utilization_data()
+            hourly_df = load_hourly_data()
+            sessions_df = load_sessions_data()
         show_data_explorer(stations_df, utilization_df, hourly_df, sessions_df)
 
 def show_overview_dashboard(stations_df, utilization_df, hourly_df, sessions_df, latest_status_df):
@@ -815,42 +768,51 @@ def show_utilization_dashboard(utilization_df, hourly_df, sessions_df):
         st.subheader("24-Hour Utilization Heatmap")
         
         if not utilization_df.empty:
-            # Prepare heatmap data
+            # Prepare heatmap data using actual hour from timestamp
             heatmap_data = utilization_df.copy()
-            heatmap_data['hour'] = heatmap_data['timestamp'].dt.hour
+            heatmap_data['hour'] = heatmap_data['timestamp'].dt.hour  # Real hour (0-23)
             heatmap_data['day_name'] = heatmap_data['timestamp'].dt.day_name()
             
-            # Create pivot table
+            # Create pivot table with actual occupancy rates
             pivot_data = heatmap_data.groupby(['day_name', 'hour'])['is_occupied'].mean().reset_index()
             pivot_table = pivot_data.pivot(index='day_name', columns='hour', values='is_occupied')
             
-            # Ensure all hours are present
+            # Ensure all 24 hours are present (0-23)
             for hour in range(24):
                 if hour not in pivot_table.columns:
                     pivot_table[hour] = 0
             
+            # Sort columns to show hours 0-23 in order
+            pivot_table = pivot_table.reindex(sorted(pivot_table.columns), axis=1)
+            
             # Order days correctly
             day_order = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
-            pivot_table = pivot_table.reindex([d for d in day_order if d in pivot_table.index])
+            available_days = [d for d in day_order if d in pivot_table.index]
+            pivot_table = pivot_table.reindex(available_days)
             pivot_table = pivot_table.fillna(0)
             
-            # Create heatmap
+            # Create heatmap with proper hour labels
             fig_heatmap = go.Figure(data=go.Heatmap(
                 z=pivot_table.values,
-                x=list(range(24)),
+                x=pivot_table.columns.tolist(),  # Use actual hours 0-23
                 y=pivot_table.index.tolist(),
                 colorscale='RdYlGn_r',
                 colorbar=dict(title='Occupancy Rate'),
                 hoverongaps=False,
-                hovertemplate='Day: %{y}<br>Hour: %{x}<br>Occupancy: %{z:.1%}<extra></extra>'
+                hovertemplate='Day: %{y}<br>Hour: %{x}:00<br>Occupancy: %{z:.1%}<extra></extra>'
             ))
             
             fig_heatmap.update_layout(
-                title='Weekly Utilization Pattern',
-                xaxis_title='Hour of Day',
+                title='Weekly Utilization Pattern (24-Hour Format)',
+                xaxis_title='Hour of Day (0-23)',
                 yaxis_title='Day of Week',
                 height=400,
-                xaxis=dict(tickmode='linear', tick0=0, dtick=2)
+                xaxis=dict(
+                    tickmode='linear',
+                    tick0=0,
+                    dtick=2,  # Show every 2 hours
+                    ticksuffix=':00'
+                )
             )
             
             st.plotly_chart(fig_heatmap, use_container_width=True)
